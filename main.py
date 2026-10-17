@@ -1188,7 +1188,7 @@ async def stream_with_retry(
 
 GCLOUD_CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
 GCLOUD_CLIENT_SECRET = "d-FL95Q19q7MQmFpd7hHD0Ty"
-GCLOUD_REDIRECT_URI = "https://sdk.cloud.google.com/authn.html"
+GCLOUD_REDIRECT_URI = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
 _oauth_pkce_store: Dict[str, str] = {}
 
 
@@ -1207,7 +1207,7 @@ async def admin_get_oauth_url():
         "response_type": "code",
         "client_id": GCLOUD_CLIENT_ID,
         "redirect_uri": GCLOUD_REDIRECT_URI,
-        "scope": "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/generative-language.retriever",
+        "scope": "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/sqlservice.login",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "access_type": "offline",
