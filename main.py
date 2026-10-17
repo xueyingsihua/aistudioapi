@@ -19,7 +19,7 @@ class KeyPool:
     def __init__(self):
         self.admin_password = os.getenv("ADMIN_PASSWORD", "123456")
         self.access_token = os.getenv("PROXY_API_KEY", "")
-        self.keep_alive_url = os.getenv("KEEP_ALIVE_URL", "")
+        self.keep_alive_url = os.getenv("KEEP_ALIVE_URL", "").strip()
         self.keep_alive_interval = int(os.getenv("KEEP_ALIVE_INTERVAL", "300"))
         self.keys: List[Dict[str, Any]] = []
         self.pro_index = 0
@@ -950,11 +950,12 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h3>💓 Render 自动保活设置</h3>
-      <p style="color:var(--muted);font-size:14px;">填入你部署后的 Render 网址（如 <code>https://xxx.onrender.com</code>），后台每隔 5 分钟自动访问防止休眠：</p>
-      <div style="display:flex;gap:10px;">
-        <input type="text" id="keepAliveInput" placeholder="https://你的项目名.onrender.com" style="margin:0;">
-        <button onclick="saveKeepAlive()" style="white-space:nowrap;">保存保活网址</button>
+      <h3>💓 Render 自动保活设置（可选，点保存后生效）</h3>
+      <p style="color:var(--muted);font-size:14px;">需要 24 小时保活防休眠时，点击<b>「🎯 一键提取当前网址」</b>再点<b>「保存并开启」</b>即可；如果不需要保活（节省每月免费时长），清空输入框点保存即可关闭：</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <input type="text" id="keepAliveInput" placeholder="留空则不开启自动保活" style="margin:0;flex:1;min-width:240px;">
+        <button class="secondary" onclick="fillCurrentUrl()" style="white-space:nowrap;">🎯 一键提取当前网址</button>
+        <button onclick="saveKeepAlive()" style="white-space:nowrap;">💾 保存设置</button>
       </div>
       <p style="color:var(--muted);font-size:13px;margin-top:8px;">最近一次自检时间：<span id="pingTime">-</span></p>
     </div>
@@ -1031,7 +1032,7 @@ function renderData(data) {
   document.getElementById("statPro").innerText = activePro + " 个启用";
   document.getElementById("statFree").innerText = activeFree + " 个启用";
   document.getElementById("statReqs").innerText = data.total_requests;
-  document.getElementById("statPing").innerText = data.last_ping_status;
+  document.getElementById("statPing").innerText = data.keep_alive_url ? data.last_ping_status : "未开启 (留空)";
   document.getElementById("pingTime").innerText = data.last_ping_time;
   document.getElementById("keepAliveInput").value = data.keep_alive_url || "";
   document.getElementById("exportProVal").value = data.pro_env_export || "";
@@ -1149,13 +1150,17 @@ async function testAllKeys() {
   alert("全部 Key 测活与 Pro/Free 层级自动识别完成！记得点一下【一键复制 Render 环境变量】备份哦！");
 }
 
+function fillCurrentUrl() {
+  document.getElementById("keepAliveInput").value = window.location.origin;
+}
+
 async function saveKeepAlive() {
-  const url = document.getElementById("keepAliveInput").value;
+  const url = document.getElementById("keepAliveInput").value.trim();
   await fetch("/api/admin/keepalive", {
     method: "POST", headers: {"Content-Type": "application/json", "x-admin-password": pwd},
     body: JSON.stringify({url})
   });
-  alert("保活地址已保存！");
+  alert(url ? "✅ 保活网址已保存并开启自动保活！" : "⏸️ 保活网址已清空，自动保活已关闭！");
   loadStatus();
 }
 </script>
