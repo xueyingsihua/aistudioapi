@@ -372,60 +372,92 @@ async def admin_test_key(data: Dict[str, Any]):
     item = pool.keys[idx]
     key = item["key"]
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=25.0) as client:
         try:
+            # 先从该 Key 自己的 /v1beta/models 获取它支持的所有 generateContent 模型列表
+            pro_candidates = ["gemini-2.5-pro"]
+            flash_candidates = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
+            r_models = await client.get(f"{GOOGLE_BASE_URL}/v1beta/models", params={"key": key})
+            if r_models.status_code == 200:
+                avail_pro = []
+                avail_flash = []
+                for m in r_models.json().get("models", []):
+                    methods = m.get("supportedGenerationMethods", [])
+                    if "generateContent" not in methods:
+                        continue
+                    name = m.get("name", "").replace("models/", "")
+                    low = name.lower()
+                    if "gemini" not in low or "tts" in low or "image" in low or "vision" in low:
+                        continue
+                    if "pro" in low:
+                        avail_pro.append(name)
+                    elif "flash" in low:
+                        avail_flash.append(name)
+                if avail_pro:
+                    # 优先测最新 pro
+                    pro_candidates = sorted(avail_pro, reverse=True)[:3]
+                if avail_flash:
+                    # 优先测最新 flash (如 gemini-3-flash / gemini-flash-latest / gemini-2.5-flash)
+                    flash_candidates = sorted(avail_flash, reverse=True)[:4]
+
             test_body = {"contents": [{"parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
 
-            # 1. 真刀真枪测试能否调用 Pro 模型生成内容
-            r_pro = await client.post(
-                f"{GOOGLE_BASE_URL}/v1beta/models/gemini-2.5-pro:generateContent",
-                params={"key": key},
-                json=test_body
-            )
-            if r_pro.status_code == 200:
-                item["tier"] = "pro"
-                item["enabled"] = True
-                item["last_error"] = "✅ 实测可跑 Pro (💎赠金/付费层级)"
-                pool.save()
-                return {"ok": True, "msg": "🎉 测活成功！该 Key 实测可调用 Pro 模型，已归入【💎 赠金/Pro池】"}
-
-            # 提取 Pro 失败原因简述
+            # 1. 依次测试该账号支持的 Pro 模型
+            last_pro_status = 0
             pro_err_detail = ""
-            try:
-                pro_err_detail = r_pro.json().get("error", {}).get("message", "")[:60]
-            except Exception:
-                pro_err_detail = r_pro.text[:60]
+            for pm in pro_candidates:
+                r_pro = await client.post(
+                    f"{GOOGLE_BASE_URL}/v1beta/models/{pm}:generateContent",
+                    params={"key": key},
+                    json=test_body
+                )
+                last_pro_status = r_pro.status_code
+                if r_pro.status_code == 200:
+                    item["tier"] = "pro"
+                    item["enabled"] = True
+                    item["last_error"] = f"✅ 实测可跑 {pm} (💎赠金/付费池)"
+                    pool.save()
+                    return {"ok": True, "msg": f"🎉 测活成功！该 Key 实测可调用 {pm}，已归入【💎 赠金/Pro池】"}
+                try:
+                    pro_err_detail = r_pro.json().get("error", {}).get("message", "")
+                except Exception:
+                    pro_err_detail = r_pro.text[:120]
+                # 如果是 404 (该旧型号对新号停用)，继续试下一个最新型号；如果是 429/403 (无Pro权限)，直接跳去测 Flash
+                if r_pro.status_code in (429, 403):
+                    break
 
-            # 2. 如果 Pro 跑不通，真刀真枪测试能否调用 Flash 模型生成内容（绝不用 models 列表糊弄）
-            r_flash = await client.post(
-                f"{GOOGLE_BASE_URL}/v1beta/models/gemini-2.5-flash:generateContent",
-                params={"key": key},
-                json=test_body
-            )
-            if r_flash.status_code == 200:
-                item["tier"] = "free"
-                item["enabled"] = True
-                item["last_error"] = "✅ 实测仅可跑 Flash (⚡免费层级)"
-                pool.save()
-                return {
-                    "ok": True,
-                    "msg": f"⚡ 测活完成：该 Key 无法跑 Pro（HTTP {r_pro.status_code}），但实测可正常跑 Flash，已自动归入【⚡ 免费/Flash池】！"
-                }
-
-            # 3. 连 Flash 都无法生成内容 -> 彻底不可用（如结算被封、Key无效、地区限制或配额彻底为0）
+            # 2. 依次测试该账号支持的 Flash 模型
+            last_flash_status = 0
             flash_err_detail = ""
-            try:
-                flash_err_detail = r_flash.json().get("error", {}).get("message", "")[:80]
-            except Exception:
-                flash_err_detail = r_flash.text[:80]
+            for fm in flash_candidates:
+                r_flash = await client.post(
+                    f"{GOOGLE_BASE_URL}/v1beta/models/{fm}:generateContent",
+                    params={"key": key},
+                    json=test_body
+                )
+                last_flash_status = r_flash.status_code
+                if r_flash.status_code == 200:
+                    item["tier"] = "free"
+                    item["enabled"] = True
+                    item["last_error"] = f"✅ 实测可跑 {fm} (⚡免费池)"
+                    pool.save()
+                    return {
+                        "ok": True,
+                        "msg": f"⚡ 测活成功！该新号实测可正常调用 {fm}（免费层级），已自动启用并归入【⚡ 免费/Flash池】！"
+                    }
+                try:
+                    flash_err_detail = r_flash.json().get("error", {}).get("message", "")
+                except Exception:
+                    flash_err_detail = r_flash.text[:120]
 
-            item["enabled"] = False  # 自动暂停不可用的废号，避免污染轮询池
-            err_msg = f"❌ 不可用已自动暂停 (HTTP {r_flash.status_code}): {flash_err_detail or pro_err_detail}"
+            # 3. 所有型号均无法生成内容 -> 彻底不可用
+            item["enabled"] = False
+            err_msg = f"❌ 不可用已暂停 (HTTP {last_flash_status}): {(flash_err_detail or pro_err_detail)[:120]}"
             item["last_error"] = err_msg
             pool.save()
             return {"ok": False, "msg": err_msg}
         except Exception as e:
-            item["last_error"] = f"❌ 网络异常: {str(e)[:80]}"
+            item["last_error"] = f"❌ 网络异常: {str(e)[:100]}"
             pool.save()
             return {"ok": False, "msg": str(e)}
 
@@ -618,7 +650,7 @@ async def openai_nonstream_via_native_retry(
                     key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {resp.text[:100]}"
                     last_status = resp.status_code
                     last_err_text = resp.text
-                    if resp.status_code in (429, 401, 403, 500, 502, 503, 504):
+                    if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
                         continue
                     else:
                         break
@@ -696,7 +728,7 @@ async def openai_stream_via_native_retry(
                         key_item["fail"] = key_item.get("fail", 0) + 1
                         key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {err_str[:100]}"
                         last_err = err_str
-                        if resp.status_code in (429, 401, 403, 500, 502, 503, 504):
+                        if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
                             continue
                         else:
                             break
@@ -792,7 +824,7 @@ async def request_with_retry(
                     key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {resp.text[:100]}"
                     last_status = resp.status_code
                     last_content = resp.content
-                    if resp.status_code in (429, 401, 403, 500, 502, 503, 504):
+                    if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
                         continue
                     else:
                         return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -835,7 +867,7 @@ async def stream_with_retry(
                         key_item["fail"] = key_item.get("fail", 0) + 1
                         key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {err_body.decode('utf-8', 'ignore')[:100]}"
                         last_err_bytes = err_body
-                        if resp.status_code in (429, 401, 403, 500, 502, 503, 504):
+                        if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
                             continue
                         else:
                             yield err_body
