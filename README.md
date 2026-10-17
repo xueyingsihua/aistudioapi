@@ -9,7 +9,7 @@
 
 点击下方按钮即可一键免费部署你自己的专属反代（无需懂代码）：
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/xueyingsihua/aistudioapi)
 [![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates)
 
 > 💡 **一键部署超简单步骤**：
