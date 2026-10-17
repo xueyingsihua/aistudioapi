@@ -3,8 +3,9 @@ import re
 import json
 import time
 import uuid
+import base64
 import asyncio
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header, Depends
@@ -14,6 +15,37 @@ from fastapi.middleware.cors import CORSMiddleware
 DATA_FILE = "config_data.json"
 GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com"
 VERTEX_BASE_URL = "https://aiplatform.googleapis.com/v1/publishers/google"
+
+_gcli_token_cache: Dict[str, Tuple[str, float, str]] = {}
+
+
+async def resolve_gcli_token(raw_key: str, client: httpx.AsyncClient) -> Tuple[str, str]:
+    """解析 GCLI:base64 凭证并自动刷新 OAuth Access Token，返回 (access_token, project_id)"""
+    now = time.time()
+    cached = _gcli_token_cache.get(raw_key)
+    if cached and cached[1] > now + 60:
+        return cached[0], cached[2]
+
+    b64_part = raw_key[5:].strip()
+    padding = "=" * ((4 - len(b64_part) % 4) % 4)
+    cred = json.loads(base64.urlsafe_b64decode(b64_part + padding).decode("utf-8"))
+    project_id = cred.get("project_id") or cred.get("quota_project_id") or ""
+    resp = await client.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": cred["client_id"],
+            "client_secret": cred["client_secret"],
+            "refresh_token": cred["refresh_token"],
+            "grant_type": "refresh_token",
+        },
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OAuth刷新失败({resp.status_code}): {resp.text[:80]}")
+    tok_data = resp.json()
+    access_token = tok_data["access_token"]
+    expires_in = int(tok_data.get("expires_in", 3500))
+    _gcli_token_cache[raw_key] = (access_token, now + expires_in, project_id)
+    return access_token, project_id
 
 
 class KeyPool:
@@ -365,6 +397,25 @@ async def admin_change_password(data: Dict[str, str]):
     return {"ok": True}
 
 
+def ensure_vertex_role(body_bytes: bytes) -> bytes:
+    """Vertex AI 强制要求 contents 里的每一项都有 role 字段，若酒馆原生请求未带 role 则自动补上 user"""
+    if not body_bytes:
+        return body_bytes
+    try:
+        data = json.loads(body_bytes)
+        changed = False
+        if isinstance(data, dict) and isinstance(data.get("contents"), list):
+            for c in data["contents"]:
+                if isinstance(c, dict) and "role" not in c:
+                    c["role"] = "user"
+                    changed = True
+        if changed:
+            return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        pass
+    return body_bytes
+
+
 @app.post("/api/admin/keys/test", dependencies=[Depends(verify_admin)])
 async def admin_test_key(data: Dict[str, Any]):
     idx = data.get("index", -1)
@@ -375,6 +426,37 @@ async def admin_test_key(data: Dict[str, Any]):
 
     async with httpx.AsyncClient(timeout=25.0) as client:
         try:
+            test_body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
+
+            # 0. 如果是 GCLI: 开头的 Google Cloud OAuth 赠金凭证，直接走 Vertex AI 项目通道测试
+            if key.startswith("GCLI:"):
+                access_token, project_id = await resolve_gcli_token(key, client)
+                if not project_id:
+                    raise RuntimeError("GCLI 凭证中缺少 project_id")
+                for vpm in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                    v_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{vpm}:generateContent"
+                    r_v = await client.post(
+                        v_url,
+                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                        json=test_body
+                    )
+                    if r_v.status_code == 200:
+                        is_pro = "pro" in vpm
+                        item["tier"] = "pro" if is_pro else "free"
+                        item["channel"] = "gcli"
+                        item["enabled"] = True
+                        item["last_error"] = f"✅ GCP赠金通道可跑 {vpm} (项目: {project_id})"
+                        pool.save()
+                        return {
+                            "ok": True,
+                            "msg": f"🎉 测活成功！GCLI 赠金凭证已激活 {vpm}（直接抵扣 40 刀 GCP 赠金，无需预充值），已归入【💎 赠金/Pro池】！"
+                        }
+                err_txt = r_v.text[:120]
+                item["enabled"] = False
+                item["last_error"] = f"❌ GCLI 报错 ({r_v.status_code}): {err_txt}"
+                pool.save()
+                return {"ok": False, "msg": item["last_error"]}
+
             # 先从该 Key 自己的 /v1beta/models 获取它支持的所有 generateContent 模型列表
             pro_candidates = ["gemini-2.5-pro"]
             flash_candidates = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
@@ -401,8 +483,6 @@ async def admin_test_key(data: Dict[str, Any]):
                     # 优先测最新 flash (如 gemini-3-flash / gemini-flash-latest / gemini-2.5-flash)
                     flash_candidates = sorted(avail_flash, reverse=True)[:4]
 
-            test_body = {"contents": [{"parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
-
             # 1. 依次测试该账号支持的 Pro 模型
             last_pro_status = 0
             pro_err_detail = ""
@@ -415,6 +495,7 @@ async def admin_test_key(data: Dict[str, Any]):
                 last_pro_status = r_pro.status_code
                 if r_pro.status_code == 200:
                     item["tier"] = "pro"
+                    item["channel"] = "aistudio"
                     item["enabled"] = True
                     item["last_error"] = f"✅ 实测可跑 {pm} (💎赠金/付费池)"
                     pool.save()
@@ -423,8 +504,7 @@ async def admin_test_key(data: Dict[str, Any]):
                     pro_err_detail = r_pro.json().get("error", {}).get("message", "")
                 except Exception:
                     pro_err_detail = r_pro.text[:120]
-                # 如果是 404 (该旧型号对新号停用)，继续试下一个最新型号；如果是 429/403 (无Pro权限)，直接跳去测 Flash
-                if r_pro.status_code in (429, 403):
+                if r_pro.status_code in (402, 429, 403):
                     break
 
             # 2. 依次测试该账号支持的 Flash 模型
@@ -439,6 +519,7 @@ async def admin_test_key(data: Dict[str, Any]):
                 last_flash_status = r_flash.status_code
                 if r_flash.status_code == 200:
                     item["tier"] = "free"
+                    item["channel"] = "aistudio"
                     item["enabled"] = True
                     item["last_error"] = f"✅ 实测可跑 {fm} (⚡免费池)"
                     pool.save()
@@ -450,47 +531,40 @@ async def admin_test_key(data: Dict[str, Any]):
                     flash_err_detail = r_flash.json().get("error", {}).get("message", "")
                 except Exception:
                     flash_err_detail = r_flash.text[:120]
+                if r_flash.status_code == 402:
+                    break
 
             # 3. 如果 AI Studio 报 402 (预付款余额为0，但有GCP赠金) 或 AQ. 绑定的服务账号 Key，自动实测 Google Cloud Vertex AI 通道！
-            vertex_pro_models = ["gemini-2.5-pro", "gemini-1.5-pro"]
+            vertex_err_detail = ""
+            vertex_pro_models = ["gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.5-flash"]
             for vpm in vertex_pro_models:
-                r_vpro = await client.post(
+                r_v = await client.post(
                     f"{VERTEX_BASE_URL}/models/{vpm}:generateContent",
                     params={"key": key},
                     json=test_body
                 )
-                if r_vpro.status_code == 200:
-                    item["tier"] = "pro"
+                if r_v.status_code == 200:
+                    is_pro = "pro" in vpm
+                    item["tier"] = "pro" if is_pro else "free"
                     item["channel"] = "vertex"
                     item["enabled"] = True
-                    item["last_error"] = f"✅ Vertex通道可跑 {vpm} (💎GCP赠金池)"
+                    pool_label = "💎GCP赠金/Pro池" if is_pro else "⚡Vertex/Flash池"
+                    item["last_error"] = f"✅ Vertex通道可跑 {vpm} ({pool_label})"
                     pool.save()
                     return {
                         "ok": True,
-                        "msg": f"🎉 测活成功！已通过 Google Cloud Vertex AI 通道激活 {vpm}（绕过AI Studio 402限制，直接抵扣GCP赠金），归入【💎 赠金/Pro池】！"
+                        "msg": f"🎉 测活成功！已通过 Google Cloud Vertex AI 通道激活 {vpm}（直接抵扣GCP赠金），归入【{pool_label}】！"
                     }
-
-            vertex_flash_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
-            for vfm in vertex_flash_models:
-                r_vflash = await client.post(
-                    f"{VERTEX_BASE_URL}/models/{vfm}:generateContent",
-                    params={"key": key},
-                    json=test_body
-                )
-                if r_vflash.status_code == 200:
-                    item["tier"] = "free"
-                    item["channel"] = "vertex"
-                    item["enabled"] = True
-                    item["last_error"] = f"✅ Vertex通道可跑 {vfm} (⚡GCP池)"
-                    pool.save()
-                    return {
-                        "ok": True,
-                        "msg": f"⚡ 测活成功！已通过 Vertex AI 通道激活 {vfm}，归入【⚡ 免费/Flash池】！"
-                    }
+                else:
+                    try:
+                        vertex_err_detail = f"Vertex({ r_v.status_code }): " + r_v.json().get("error", {}).get("message", "")[:60]
+                    except Exception:
+                        vertex_err_detail = f"Vertex({ r_v.status_code }): " + r_v.text[:60]
 
             # 4. 所有通道与型号均无法生成内容 -> 彻底不可用
             item["enabled"] = False
-            err_msg = f"❌ 不可用已暂停 (HTTP {last_flash_status}): {(flash_err_detail or pro_err_detail)[:120]}"
+            base_err = (flash_err_detail or pro_err_detail)[:80]
+            err_msg = f"❌ 不可用已暂停 (AIStudio {last_flash_status}: {base_err} | {vertex_err_detail})"
             item["last_error"] = err_msg
             pool.save()
             return {"ok": False, "msg": err_msg}
@@ -597,30 +671,35 @@ def gemini_resp_to_openai(gemini_data: Dict[str, Any], model_name: str) -> Dict[
     }
 
 
-# ==================== 1. OpenAI 兼容接口 (底层全走 ?key= 原生通道，100% 兼容 AQ. 密钥) ====================
+# ==================== 1. OpenAI 兼容接口 (底层全走原生通道，100% 兼容 GCLI: / AQ. / AIza 密钥) ====================
 @app.get("/v1/models")
 async def openai_list_models(request: Request):
     check_client_auth(request)
     default_models = [
         "gemini-2.5-pro", "gemini-2.5-flash",
+        "gemini-3-flash-preview", "gemini-flash-latest",
         "gemini-2.5-flash-lite", "gemini-2.0-flash",
         "gemini-1.5-pro", "gemini-1.5-flash"
     ]
-    candidates = pool.get_candidates_for_model("flash")
+    candidates = [c for c in pool.get_candidates_for_model("flash") if not c["key"].startswith("GCLI:")]
     if not candidates:
         return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "google"} for m in default_models]}
 
     key_item = candidates[0]
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # 直接走 ?key= 的 v1beta/models，彻底避开 /v1beta/openai/ 对 AQ. 的 401 Bug
         r2 = await client.get(f"{GOOGLE_BASE_URL}/v1beta/models", params={"key": key_item["key"]})
         if r2.status_code == 200:
             models_data = r2.json().get("models", [])
             out = []
+            seen = set()
             for m in models_data:
                 name = m.get("name", "").replace("models/", "")
-                if name:
+                if name and name not in seen:
+                    seen.add(name)
                     out.append({"id": name, "object": "model", "owned_by": "google"})
+            for dm in default_models:
+                if dm not in seen:
+                    out.append({"id": dm, "object": "model", "owned_by": "google"})
             return {"object": "list", "data": out}
         return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "google"} for m in default_models]}
 
@@ -664,6 +743,43 @@ async def openai_chat_completions(request: Request):
         )
 
 
+async def build_targets_for_key(
+    k: str,
+    key_item: Dict[str, Any],
+    model_name: str,
+    action: str,
+    query_str: str,
+    version_prefix: str,
+    raw_path: str,
+    client: httpx.AsyncClient
+) -> List[Tuple[str, Dict[str, str]]]:
+    """根据 Key 类型 (GCLI: / AQ. / AIza) 构建请求 (URL, Headers) 列表"""
+    if k.startswith("GCLI:"):
+        access_token, project_id = await resolve_gcli_token(k, client)
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        if not model_name:
+            # 兼容获取模型列表请求
+            return []
+        vx_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
+        if query_str:
+            vx_url += f"?{query_str}"
+        return [(vx_url, headers)]
+
+    headers = {"Content-Type": "application/json"}
+    ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{raw_path}?key={k}"
+    if query_str:
+        ai_url += f"&{query_str}"
+
+    if model_name and action:
+        vx_url = f"{VERTEX_BASE_URL}/models/{model_name}:{action}?key={k}"
+        if query_str:
+            vx_url += f"&{query_str}"
+        if key_item.get("channel") == "vertex" or k.startswith("AQ."):
+            return [(vx_url, headers), (ai_url, headers)]
+        return [(ai_url, headers), (vx_url, headers)]
+    return [(ai_url, headers)]
+
+
 async def openai_nonstream_via_native_retry(
     model_name: str,
     gemini_body: bytes,
@@ -675,21 +791,24 @@ async def openai_nonstream_via_native_retry(
         for key_item in candidates:
             k = key_item["key"]
             key_item["last_used"] = time.strftime("%H:%M:%S")
-            is_vertex = key_item.get("channel") == "vertex" or k.startswith("AQ.")
-            urls_to_try = (
-                [f"{VERTEX_BASE_URL}/models/{model_name}:generateContent?key={k}",
-                 f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:generateContent?key={k}"]
-                if is_vertex else
-                [f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:generateContent?key={k}",
-                 f"{VERTEX_BASE_URL}/models/{model_name}:generateContent?key={k}"]
-            )
-            for url in urls_to_try:
+            try:
+                targets = await build_targets_for_key(
+                    k, key_item, model_name, "generateContent", "", "v1beta",
+                    f"models/{model_name}:generateContent", client
+                )
+            except Exception as e:
+                last_err_text = str(e)
+                key_item["fail"] = key_item.get("fail", 0) + 1
+                key_item["last_error"] = f"OAuth异常: {last_err_text[:80]}"
+                continue
+
+            for url, hdrs in targets:
                 try:
-                    resp = await client.post(url, headers={"Content-Type": "application/json"}, content=gemini_body)
+                    resp = await client.post(url, headers=hdrs, content=gemini_body)
                     if resp.status_code == 200:
                         key_item["success"] = key_item.get("success", 0) + 1
                         key_item["last_error"] = f"OK ({model_name})"
-                        if "aiplatform.googleapis.com" in url:
+                        if "aiplatform.googleapis.com" in url and not k.startswith("GCLI:"):
                             key_item["channel"] = "vertex"
                         openai_resp = gemini_resp_to_openai(resp.json(), model_name)
                         return JSONResponse(content=openai_resp, status_code=200)
@@ -718,73 +837,67 @@ async def openai_stream_via_native_retry(
     for key_item in candidates:
         k = key_item["key"]
         key_item["last_used"] = time.strftime("%H:%M:%S")
-        is_vertex = key_item.get("channel") == "vertex" or k.startswith("AQ.")
-        urls_to_try = (
-            [f"{VERTEX_BASE_URL}/models/{model_name}:streamGenerateContent?alt=sse&key={k}",
-             f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={k}"]
-            if is_vertex else
-            [f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={k}",
-             f"{VERTEX_BASE_URL}/models/{model_name}:streamGenerateContent?alt=sse&key={k}"]
-        )
-        for url in urls_to_try:
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream(
-                        "POST",
-                        url,
-                        headers={"Content-Type": "application/json"},
-                        content=gemini_body
-                    ) as resp:
-                        if resp.status_code == 200:
-                            key_item["success"] = key_item.get("success", 0) + 1
-                            key_item["last_error"] = f"OK ({model_name})"
-                            if "aiplatform.googleapis.com" in url:
-                                key_item["channel"] = "vertex"
-                            async for line in resp.aiter_lines():
-                                if not line or not line.startswith("data:"):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                targets = await build_targets_for_key(
+                    k, key_item, model_name, "streamGenerateContent", "alt=sse", "v1beta",
+                    f"models/{model_name}:streamGenerateContent", client
+                )
+                for url, hdrs in targets:
+                    try:
+                        async with client.stream("POST", url, headers=hdrs, content=gemini_body) as resp:
+                            if resp.status_code == 200:
+                                key_item["success"] = key_item.get("success", 0) + 1
+                                key_item["last_error"] = f"OK ({model_name})"
+                                if "aiplatform.googleapis.com" in url and not k.startswith("GCLI:"):
+                                    key_item["channel"] = "vertex"
+                                async for line in resp.aiter_lines():
+                                    if not line or not line.startswith("data:"):
+                                        continue
+                                    data_str = line[5:].strip()
+                                    if not data_str or data_str == "[DONE]":
+                                        continue
+                                    try:
+                                        g_chunk = json.loads(data_str)
+                                        cands = g_chunk.get("candidates", [])
+                                        if cands:
+                                            parts = cands[0].get("content", {}).get("parts", [])
+                                            text_piece = "".join(p.get("text", "") for p in parts if "text" in p)
+                                            if text_piece:
+                                                oai_chunk = {
+                                                    "id": chat_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": created,
+                                                    "model": model_name,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {"content": text_piece},
+                                                        "finish_reason": None
+                                                    }]
+                                                }
+                                                yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                    except Exception:
+                                        continue
+                                done_chunk = {
+                                    "id": chat_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_name,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                                }
+                                yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                                return
+                            else:
+                                err_body = await resp.aread()
+                                err_str = err_body.decode("utf-8", "ignore")
+                                last_err = err_str
+                                if resp.status_code in (402, 403, 401, 404):
                                     continue
-                                data_str = line[5:].strip()
-                                if not data_str or data_str == "[DONE]":
-                                    continue
-                                try:
-                                    g_chunk = json.loads(data_str)
-                                    cands = g_chunk.get("candidates", [])
-                                    if cands:
-                                        parts = cands[0].get("content", {}).get("parts", [])
-                                        text_piece = "".join(p.get("text", "") for p in parts if "text" in p)
-                                        if text_piece:
-                                            oai_chunk = {
-                                                "id": chat_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": model_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"content": text_piece},
-                                                    "finish_reason": None
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
-                                except Exception:
-                                    continue
-                            done_chunk = {
-                                "id": chat_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                            }
-                            yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
-                            return
-                        else:
-                            err_body = await resp.aread()
-                            err_str = err_body.decode("utf-8", "ignore")
-                            last_err = err_str
-                            if resp.status_code in (402, 403, 401, 404):
-                                continue
-            except Exception as e:
-                last_err = str(e)
-                continue
+                    except Exception as e:
+                        last_err = str(e)
+                        continue
+        except Exception as e:
+            last_err = str(e)
         key_item["fail"] = key_item.get("fail", 0) + 1
         key_item["last_error"] = f"[{model_name}] {last_err[:100]}"
 
@@ -797,33 +910,34 @@ async def openai_stream_via_native_retry(
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def google_native_proxy(path: str, request: Request):
     check_client_auth(request)
-    m_match = re.search(r"models/([^/:]+)", path)
+    m_match = re.search(r"models/([^/:]+)(?::(.+))?", path)
     model_name = m_match.group(1) if m_match else ""
+    action = m_match.group(2) if (m_match and m_match.group(2)) else ""
+
+    # 如果客户端只是请求 /v1beta/models 列表，且池子里只有 GCLI 凭证，直接返回内置完整模型列表
+    if path.rstrip("/") == "models" and request.method == "GET":
+        non_gcli = [k for k in pool.keys if k.get("enabled", True) and not k["key"].startswith("GCLI:")]
+        if not non_gcli:
+            return {
+                "models": [
+                    {"name": "models/gemini-2.5-pro", "displayName": "Gemini 2.5 Pro", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+                    {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+                    {"name": "models/gemini-3-flash-preview", "displayName": "Gemini 3 Flash Preview", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+                    {"name": "models/gemini-2.0-flash", "displayName": "Gemini 2.0 Flash", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+                ]
+            }
 
     candidates = pool.get_candidates_for_model(model_name)
     if not candidates:
         raise HTTPException(status_code=503, detail="反代池中没有可用的 API Key，请先登录网页管理面板添加 Key！")
 
     pool.total_requests += 1
-    body = await request.body()
+    raw_body = await request.body()
+    body = ensure_vertex_role(raw_body)
     version_prefix = "v1beta" if request.url.path.startswith("/v1beta") else "v1"
 
     query_items = [(k, v) for k, v in request.query_params.multi_items() if k.lower() != "key"]
     query_str = "&".join([f"{k}={v}" for k, v in query_items])
-
-    def build_urls_for_item(key_item: Dict[str, Any]) -> List[str]:
-        api_key = key_item["key"]
-        ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{path}?key={api_key}"
-        if query_str:
-            ai_url += f"&{query_str}"
-        if path.startswith("models/") and (":" in path):
-            vx_url = f"{VERTEX_BASE_URL}/{path}?key={api_key}"
-            if query_str:
-                vx_url += f"&{query_str}"
-            if key_item.get("channel") == "vertex":
-                return [vx_url, ai_url]
-            return [ai_url, vx_url]
-        return [ai_url]
 
     is_stream = "streamGenerateContent" in path or request.query_params.get("alt") == "sse"
     candidates = candidates[:min(len(candidates), 6)]
@@ -833,32 +947,38 @@ async def google_native_proxy(path: str, request: Request):
         return StreamingResponse(
             stream_with_retry(
                 method=request.method,
-                urls_builder=build_urls_for_item,
-                headers_builder=lambda k: {"Content-Type": "application/json"},
+                model_name=model_name,
+                action=action,
+                query_str=query_str,
+                version_prefix=version_prefix,
+                raw_path=path,
                 body=body,
-                candidates=candidates,
-                model_name=model_name
+                candidates=candidates
             ),
             media_type=media_type
         )
     else:
         return await request_with_retry(
             method=request.method,
-            urls_builder=build_urls_for_item,
-            headers_builder=lambda k: {"Content-Type": "application/json"},
+            model_name=model_name,
+            action=action,
+            query_str=query_str,
+            version_prefix=version_prefix,
+            raw_path=path,
             body=body,
-            candidates=candidates,
-            model_name=model_name
+            candidates=candidates
         )
 
 
 async def request_with_retry(
     method: str,
-    urls_builder,
-    headers_builder,
+    model_name: str,
+    action: str,
+    query_str: str,
+    version_prefix: str,
+    raw_path: str,
     body: bytes,
-    candidates: List[Dict[str, Any]],
-    model_name: str = ""
+    candidates: List[Dict[str, Any]]
 ):
     last_status = 500
     last_content = b'{"error": "All keys failed"}'
@@ -866,18 +986,28 @@ async def request_with_retry(
         for key_item in candidates:
             k = key_item["key"]
             key_item["last_used"] = time.strftime("%H:%M:%S")
-            for target_url in urls_builder(key_item):
+            try:
+                targets = await build_targets_for_key(
+                    k, key_item, model_name, action, query_str, version_prefix, raw_path, client
+                )
+            except Exception as e:
+                last_content = json.dumps({"error": str(e)}).encode("utf-8")
+                key_item["fail"] = key_item.get("fail", 0) + 1
+                key_item["last_error"] = f"OAuth异常: {str(e)[:80]}"
+                continue
+
+            for target_url, hdrs in targets:
                 try:
                     resp = await client.request(
                         method=method,
                         url=target_url,
-                        headers=headers_builder(k),
+                        headers=hdrs,
                         content=body if method != "GET" else None
                     )
                     if resp.status_code == 200:
                         key_item["success"] = key_item.get("success", 0) + 1
                         key_item["last_error"] = f"OK ({model_name or 'API'})"
-                        if "aiplatform.googleapis.com" in target_url:
+                        if "aiplatform.googleapis.com" in target_url and not k.startswith("GCLI:"):
                             key_item["channel"] = "vertex"
                         return Response(content=resp.content, status_code=200, media_type="application/json")
                     else:
@@ -895,41 +1025,49 @@ async def request_with_retry(
 
 async def stream_with_retry(
     method: str,
-    urls_builder,
-    headers_builder,
+    model_name: str,
+    action: str,
+    query_str: str,
+    version_prefix: str,
+    raw_path: str,
     body: bytes,
-    candidates: List[Dict[str, Any]],
-    model_name: str = ""
+    candidates: List[Dict[str, Any]]
 ):
     last_err_bytes = b'data: {"error": "All keys failed in pool"}\n\n'
     for key_item in candidates:
         k = key_item["key"]
         key_item["last_used"] = time.strftime("%H:%M:%S")
-        for target_url in urls_builder(key_item):
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream(
-                        method=method,
-                        url=target_url,
-                        headers=headers_builder(k),
-                        content=body if method != "GET" else None
-                    ) as resp:
-                        if resp.status_code == 200:
-                            key_item["success"] = key_item.get("success", 0) + 1
-                            key_item["last_error"] = f"OK ({model_name or 'stream'})"
-                            if "aiplatform.googleapis.com" in target_url:
-                                key_item["channel"] = "vertex"
-                            async for chunk in resp.aiter_bytes():
-                                yield chunk
-                            return
-                        else:
-                            err_body = await resp.aread()
-                            last_err_bytes = err_body
-                            if resp.status_code in (402, 403, 401, 404):
-                                continue
-            except Exception as e:
-                last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
-                continue
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                targets = await build_targets_for_key(
+                    k, key_item, model_name, action, query_str, version_prefix, raw_path, client
+                )
+                for target_url, hdrs in targets:
+                    try:
+                        async with client.stream(
+                            method=method,
+                            url=target_url,
+                            headers=hdrs,
+                            content=body if method != "GET" else None
+                        ) as resp:
+                            if resp.status_code == 200:
+                                key_item["success"] = key_item.get("success", 0) + 1
+                                key_item["last_error"] = f"OK ({model_name or 'stream'})"
+                                if "aiplatform.googleapis.com" in target_url and not k.startswith("GCLI:"):
+                                    key_item["channel"] = "vertex"
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                                return
+                            else:
+                                err_body = await resp.aread()
+                                last_err_bytes = err_body
+                                if resp.status_code in (402, 403, 401, 404):
+                                    continue
+                    except Exception as e:
+                        last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
+                        continue
+        except Exception as e:
+            last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
         key_item["fail"] = key_item.get("fail", 0) + 1
         key_item["last_error"] = f"[{model_name}] {last_err_bytes.decode('utf-8', 'ignore')[:100]}"
     yield last_err_bytes
