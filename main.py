@@ -371,46 +371,61 @@ async def admin_test_key(data: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="无效索引")
     item = pool.keys[idx]
     key = item["key"]
-    auto_detect = data.get("auto_detect", True)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         try:
             test_body = {"contents": [{"parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
+
+            # 1. 真刀真枪测试能否调用 Pro 模型生成内容
+            r_pro = await client.post(
+                f"{GOOGLE_BASE_URL}/v1beta/models/gemini-2.5-pro:generateContent",
+                params={"key": key},
+                json=test_body
+            )
+            if r_pro.status_code == 200:
+                item["tier"] = "pro"
+                item["enabled"] = True
+                item["last_error"] = "✅ 实测可跑 Pro (💎赠金/付费层级)"
+                pool.save()
+                return {"ok": True, "msg": "🎉 测活成功！该 Key 实测可调用 Pro 模型，已归入【💎 赠金/Pro池】"}
+
+            # 提取 Pro 失败原因简述
+            pro_err_detail = ""
+            try:
+                pro_err_detail = r_pro.json().get("error", {}).get("message", "")[:60]
+            except Exception:
+                pro_err_detail = r_pro.text[:60]
+
+            # 2. 如果 Pro 跑不通，真刀真枪测试能否调用 Flash 模型生成内容（绝不用 models 列表糊弄）
             r_flash = await client.post(
                 f"{GOOGLE_BASE_URL}/v1beta/models/gemini-2.5-flash:generateContent",
                 params={"key": key},
                 json=test_body
             )
-            if r_flash.status_code != 200:
-                r_list = await client.get(f"{GOOGLE_BASE_URL}/v1beta/models", params={"key": key})
-                if r_list.status_code != 200:
-                    err_msg = f"不可用 (HTTP {r_list.status_code}): {r_list.text[:80]}"
-                    item["last_error"] = err_msg
-                    pool.save()
-                    return {"ok": False, "msg": err_msg}
+            if r_flash.status_code == 200:
+                item["tier"] = "free"
+                item["enabled"] = True
+                item["last_error"] = "✅ 实测仅可跑 Flash (⚡免费层级)"
+                pool.save()
+                return {
+                    "ok": True,
+                    "msg": f"⚡ 测活完成：该 Key 无法跑 Pro（HTTP {r_pro.status_code}），但实测可正常跑 Flash，已自动归入【⚡ 免费/Flash池】！"
+                }
 
-            if auto_detect:
-                r_pro = await client.post(
-                    f"{GOOGLE_BASE_URL}/v1beta/models/gemini-2.5-pro:generateContent",
-                    params={"key": key},
-                    json=test_body
-                )
-                if r_pro.status_code == 200:
-                    item["tier"] = "pro"
-                    item["last_error"] = "✅ 测活成功：支持 Pro + Flash (赠金/付费层级)"
-                    pool.save()
-                    return {"ok": True, "msg": "测活成功！该 Key 支持 Pro 模型，已设为【💎 赠金/Pro池】"}
-                elif r_pro.status_code in (429, 403):
-                    item["tier"] = "free"
-                    item["last_error"] = "✅ 测活成功：仅支持 Flash (免费层级)"
-                    pool.save()
-                    return {"ok": True, "msg": "测活成功！该 Key 仅支持 Flash（Pro返回429/403），已自动归入【⚡ 免费/Flash池】"}
+            # 3. 连 Flash 都无法生成内容 -> 彻底不可用（如结算被封、Key无效、地区限制或配额彻底为0）
+            flash_err_detail = ""
+            try:
+                flash_err_detail = r_flash.json().get("error", {}).get("message", "")[:80]
+            except Exception:
+                flash_err_detail = r_flash.text[:80]
 
-            item["last_error"] = "✅ 测活正常 (200 OK)"
+            item["enabled"] = False  # 自动暂停不可用的废号，避免污染轮询池
+            err_msg = f"❌ 不可用已自动暂停 (HTTP {r_flash.status_code}): {flash_err_detail or pro_err_detail}"
+            item["last_error"] = err_msg
             pool.save()
-            return {"ok": True, "msg": "Key 可用！"}
+            return {"ok": False, "msg": err_msg}
         except Exception as e:
-            item["last_error"] = str(e)[:80]
+            item["last_error"] = f"❌ 网络异常: {str(e)[:80]}"
             pool.save()
             return {"ok": False, "msg": str(e)}
 
