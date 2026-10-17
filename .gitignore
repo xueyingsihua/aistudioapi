@@ -1,0 +1,5 @@
+config_data.json
+__pycache__/
+*.pyc
+本地双击启动测试.bat
+双击直接看面板界面预览.html
