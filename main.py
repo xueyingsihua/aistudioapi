@@ -93,23 +93,31 @@ class KeyPool:
             if not line:
                 continue
             tier = default_tier
-            note = ""
+            channel = ""
+            note_parts = []
             if "#" in line:
-                parts = line.split("#", 2)
+                parts = line.split("#")
                 k = parts[0].strip()
-                tag = parts[1].strip().lower()
-                if tag in ("pro", "free"):
-                    tier = tag
-                else:
-                    note = parts[1].strip()
-                if len(parts) > 2:
-                    note = parts[2].strip()
+                for seg in parts[1:]:
+                    tag = seg.strip()
+                    low = tag.lower()
+                    if low in ("pro", "free"):
+                        tier = low
+                    elif low in ("vertex", "aistudio", "gcli"):
+                        channel = "vertex" if low in ("vertex", "gcli") else "aistudio"
+                    elif tag:
+                        note_parts.append(tag)
+                note = "#".join(note_parts)
             else:
                 k = line
+                note = ""
+            if not channel:
+                channel = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
             if k and not any(item["key"] == k for item in self.keys):
                 self.keys.append({
                     "key": k,
                     "tier": tier,
+                    "channel": channel,
                     "note": note,
                     "enabled": True,
                     "success": 0,
@@ -138,17 +146,31 @@ class KeyPool:
             if not line:
                 continue
             item_tier = tier
-            item_note = note
+            item_channel = ""
+            note_parts = []
             if "#" in line:
-                parts = line.split("#", 1)
+                parts = line.split("#")
                 k = parts[0].strip()
-                item_note = parts[1].strip() or note
+                for seg in parts[1:]:
+                    tag = seg.strip()
+                    low = tag.lower()
+                    if low in ("pro", "free"):
+                        item_tier = low
+                    elif low in ("vertex", "aistudio", "gcli"):
+                        item_channel = "vertex" if low in ("vertex", "gcli") else "aistudio"
+                    elif tag:
+                        note_parts.append(tag)
+                item_note = "#".join(note_parts) or note
             else:
                 k = line
+                item_note = note
+            if not item_channel:
+                item_channel = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
             if k and not any(item["key"] == k for item in self.keys):
                 self.keys.append({
                     "key": k,
                     "tier": item_tier,
+                    "channel": item_channel,
                     "note": item_note,
                     "enabled": True,
                     "success": 0,
@@ -308,7 +330,7 @@ async def admin_status():
             raw_ch = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
         channel = "vertex" if raw_ch in ("vertex", "gcli") else "aistudio"
 
-        export_item = f"{k}#{note}" if note else k
+        export_item = f"{k}#{channel}#{note}" if note else f"{k}#{channel}"
         if tier == "pro":
             pro_env_list.append(export_item)
         else:
@@ -456,7 +478,7 @@ async def admin_test_key(data: Dict[str, Any]):
                 prefer_aistudio = item.get("channel") == "aistudio"
 
                 async def _try_gcli_vertex():
-                    for vpm in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                    for vpm in ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
                         v_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{vpm}:generateContent"
                         r_v = await client.post(
                             v_url,
@@ -482,7 +504,7 @@ async def admin_test_key(data: Dict[str, Any]):
                         "x-goog-user-project": project_id,
                         "Content-Type": "application/json"
                     }
-                    for fm in ["gemini-2.5-pro", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                    for fm in ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.8-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
                         a_url = f"{GOOGLE_BASE_URL}/v1beta/models/{fm}:generateContent"
                         r_a = await client.post(a_url, headers=ai_headers, json=test_body)
                         if r_a.status_code == 200:
@@ -727,35 +749,55 @@ def gemini_resp_to_openai(gemini_data: Dict[str, Any], model_name: str) -> Dict[
 
 
 # ==================== 1. OpenAI 兼容接口 (底层全走原生通道，100% 兼容 GCLI: / AQ. / AIza 密钥) ====================
+DEFAULT_FULL_MODELS = [
+    ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
+    ("gemini-3.1-pro", "Gemini 3.1 Pro"),
+    ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+    ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+    ("gemini-3.8-flash-preview", "Gemini 3.8 Flash Preview"),
+    ("gemini-3-flash-preview", "Gemini 3.0 Flash Preview"),
+    ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+    ("gemini-flash-latest", "Gemini Flash Latest"),
+    ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
+    ("gemini-2.0-flash", "Gemini 2.0 Flash"),
+]
+
+
 @app.get("/v1/models")
 async def openai_list_models(request: Request):
     check_client_auth(request)
-    default_models = [
-        "gemini-2.5-pro", "gemini-2.5-flash",
-        "gemini-3-flash-preview", "gemini-flash-latest",
-        "gemini-2.5-flash-lite", "gemini-2.0-flash",
-        "gemini-1.5-pro", "gemini-1.5-flash"
-    ]
-    candidates = [c for c in pool.get_candidates_for_model("flash") if not c["key"].startswith("GCLI:")]
+    default_models = [m[0] for m in DEFAULT_FULL_MODELS]
+    candidates = pool.get_candidates_for_model("flash")
     if not candidates:
         return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "google"} for m in default_models]}
 
     key_item = candidates[0]
+    k = key_item["key"]
     async with httpx.AsyncClient(timeout=20.0) as client:
-        r2 = await client.get(f"{GOOGLE_BASE_URL}/v1beta/models", params={"key": key_item["key"]})
-        if r2.status_code == 200:
-            models_data = r2.json().get("models", [])
-            out = []
-            seen = set()
-            for m in models_data:
-                name = m.get("name", "").replace("models/", "")
-                if name and name not in seen:
-                    seen.add(name)
-                    out.append({"id": name, "object": "model", "owned_by": "google"})
-            for dm in default_models:
-                if dm not in seen:
+        try:
+            if k.startswith("GCLI:"):
+                access_token, project_id = await resolve_gcli_token(k, client)
+                r2 = await client.get(
+                    f"{GOOGLE_BASE_URL}/v1beta/models",
+                    headers={"Authorization": f"Bearer {access_token}", "x-goog-user-project": project_id}
+                )
+            else:
+                r2 = await client.get(f"{GOOGLE_BASE_URL}/v1beta/models", params={"key": k})
+            if r2.status_code == 200:
+                models_data = r2.json().get("models", [])
+                out = []
+                seen = set()
+                for dm in default_models:
+                    seen.add(dm)
                     out.append({"id": dm, "object": "model", "owned_by": "google"})
-            return {"object": "list", "data": out}
+                for m in models_data:
+                    name = m.get("name", "").replace("models/", "")
+                    if name and name not in seen:
+                        seen.add(name)
+                        out.append({"id": name, "object": "model", "owned_by": "google"})
+                return {"object": "list", "data": out}
+        except Exception:
+            pass
         return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "google"} for m in default_models]}
 
 
@@ -991,10 +1033,12 @@ async def google_native_proxy(path: str, request: Request):
         if not non_gcli:
             return {
                 "models": [
-                    {"name": "models/gemini-2.5-pro", "displayName": "Gemini 2.5 Pro", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
-                    {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
-                    {"name": "models/gemini-3-flash-preview", "displayName": "Gemini 3 Flash Preview", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
-                    {"name": "models/gemini-2.0-flash", "displayName": "Gemini 2.0 Flash", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+                    {
+                        "name": f"models/{m_id}",
+                        "displayName": m_title,
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                    }
+                    for m_id, m_title in DEFAULT_FULL_MODELS
                 ]
             }
 
@@ -1263,7 +1307,7 @@ async def admin_exchange_oauth(data: Dict[str, str]):
             # 如果用户指定不想用赠金 (aistudio 普通模式)，优先测普通 AI Studio 通道
             if prefer_mode == "aistudio":
                 ai_hdrs = {**headers, "x-goog-user-project": pid}
-                for m in ["gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                for m in ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
                     r_a = await client.post(f"{GOOGLE_BASE_URL}/v1beta/models/{m}:generateContent", headers=ai_hdrs, json=test_body)
                     if r_a.status_code == 200:
                         chosen_pid = pid
@@ -1275,7 +1319,7 @@ async def admin_exchange_oauth(data: Dict[str, str]):
                     break
 
             # 测 Vertex 赠金通道
-            for m in ["gemini-2.5-pro", "gemini-2.5-flash"]:
+            for m in ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.8-flash", "gemini-2.5-flash"]:
                 v_url = f"https://aiplatform.googleapis.com/v1/projects/{pid}/locations/global/publishers/google/models/{m}:generateContent"
                 r_test = await client.post(v_url, headers=headers, json=test_body)
                 if r_test.status_code == 200:
@@ -1289,7 +1333,7 @@ async def admin_exchange_oauth(data: Dict[str, str]):
 
             # 如果 Vertex 没开通计费 (纯免费小号)，自动回退测试普通 AI Studio 免费通道！
             ai_hdrs = {**headers, "x-goog-user-project": pid}
-            for m in ["gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
+            for m in ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
                 r_a = await client.post(f"{GOOGLE_BASE_URL}/v1beta/models/{m}:generateContent", headers=ai_hdrs, json=test_body)
                 if r_a.status_code == 200:
                     chosen_pid = pid
