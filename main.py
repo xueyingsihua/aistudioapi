@@ -303,6 +303,11 @@ async def admin_status():
         k = item["key"]
         note = item.get("note", "")
         tier = item.get("tier", "pro")
+        raw_ch = item.get("channel", "")
+        if not raw_ch:
+            raw_ch = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
+        channel = "vertex" if raw_ch in ("vertex", "gcli") else "aistudio"
+
         export_item = f"{k}#{note}" if note else k
         if tier == "pro":
             pro_env_list.append(export_item)
@@ -315,6 +320,7 @@ async def admin_status():
             "masked_key": masked,
             "full_key": k,
             "tier": tier,
+            "channel": channel,
             "note": note,
             "enabled": item.get("enabled", True),
             "success": item.get("success", 0),
@@ -358,6 +364,20 @@ async def admin_switch_tier(data: Dict[str, Any]):
     if 0 <= idx < len(pool.keys):
         cur = pool.keys[idx].get("tier", "pro")
         pool.keys[idx]["tier"] = "free" if cur == "pro" else "pro"
+        pool.save()
+    return {"ok": True}
+
+
+@app.post("/api/admin/keys/channel", dependencies=[Depends(verify_admin)])
+async def admin_switch_channel(data: Dict[str, Any]):
+    idx = data.get("index", -1)
+    if 0 <= idx < len(pool.keys):
+        k = pool.keys[idx]["key"]
+        cur = pool.keys[idx].get("channel", "")
+        if not cur:
+            cur = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
+        is_vx = cur in ("vertex", "gcli")
+        pool.keys[idx]["channel"] = "aistudio" if is_vx else "vertex"
         pool.save()
     return {"ok": True}
 
@@ -428,32 +448,67 @@ async def admin_test_key(data: Dict[str, Any]):
         try:
             test_body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
 
-            # 0. 如果是 GCLI: 开头的 Google Cloud OAuth 赠金凭证，直接走 Vertex AI 项目通道测试
+            # 0. 如果是 GCLI: 开头的 Google OAuth 凭证，根据当前所选通道（或双通道自动回退）测活
             if key.startswith("GCLI:"):
                 access_token, project_id = await resolve_gcli_token(key, client)
                 if not project_id:
                     raise RuntimeError("GCLI 凭证中缺少 project_id")
-                for vpm in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]:
-                    v_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{vpm}:generateContent"
-                    r_v = await client.post(
-                        v_url,
-                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        json=test_body
-                    )
-                    if r_v.status_code == 200:
-                        is_pro = "pro" in vpm
-                        item["tier"] = "pro" if is_pro else "free"
-                        item["channel"] = "gcli"
-                        item["enabled"] = True
-                        item["last_error"] = f"✅ GCP赠金通道可跑 {vpm} (项目: {project_id})"
-                        pool.save()
-                        return {
-                            "ok": True,
-                            "msg": f"🎉 测活成功！GCLI 赠金凭证已激活 {vpm}（直接抵扣 40 刀 GCP 赠金，无需预充值），已归入【💎 赠金/Pro池】！"
-                        }
-                err_txt = r_v.text[:120]
+                prefer_aistudio = item.get("channel") == "aistudio"
+
+                async def _try_gcli_vertex():
+                    for vpm in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                        v_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{vpm}:generateContent"
+                        r_v = await client.post(
+                            v_url,
+                            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                            json=test_body
+                        )
+                        if r_v.status_code == 200:
+                            is_pro = "pro" in vpm
+                            item["tier"] = "pro" if is_pro else "free"
+                            item["channel"] = "vertex"
+                            item["enabled"] = True
+                            item["last_error"] = f"✅ Vertex赠金通道可跑 {vpm} ({project_id})"
+                            pool.save()
+                            return {
+                                "ok": True,
+                                "msg": f"🎉 测活成功！已走【🏛️ Vertex 赠金通道】激活 {vpm}（抵扣 GCP 赠金），归入【💎 赠金/Pro池】！"
+                            }
+                    return None
+
+                async def _try_gcli_aistudio():
+                    ai_headers = {
+                        "Authorization": f"Bearer {access_token}",
+                        "x-goog-user-project": project_id,
+                        "Content-Type": "application/json"
+                    }
+                    for fm in ["gemini-2.5-pro", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                        a_url = f"{GOOGLE_BASE_URL}/v1beta/models/{fm}:generateContent"
+                        r_a = await client.post(a_url, headers=ai_headers, json=test_body)
+                        if r_a.status_code == 200:
+                            is_pro = "pro" in fm
+                            item["tier"] = "pro" if is_pro else "free"
+                            item["channel"] = "aistudio"
+                            item["enabled"] = True
+                            pool_name = "💎Pro池" if is_pro else "⚡免费/Flash池"
+                            item["last_error"] = f"✅ 普通通道可跑 {fm} ({pool_name})"
+                            pool.save()
+                            return {
+                                "ok": True,
+                                "msg": f"🌱 测活成功！已走【🌱 普通 AIStudio 通道（不扣Vertex赠金）】激活 {fm}，归入【{pool_name}】！"
+                            }
+                    return None
+
+                if prefer_aistudio:
+                    res = await _try_gcli_aistudio() or await _try_gcli_vertex()
+                else:
+                    res = await _try_gcli_vertex() or await _try_gcli_aistudio()
+
+                if res:
+                    return res
+
                 item["enabled"] = False
-                item["last_error"] = f"❌ GCLI 报错 ({r_v.status_code}): {err_txt}"
+                item["last_error"] = "❌ 该账号在 Vertex 与普通 AIStudio 通道均未调通"
                 pool.save()
                 return {"ok": False, "msg": item["last_error"]}
 
@@ -753,17 +808,36 @@ async def build_targets_for_key(
     raw_path: str,
     client: httpx.AsyncClient
 ) -> List[Tuple[str, Dict[str, str]]]:
-    """根据 Key 类型 (GCLI: / AQ. / AIza) 构建请求 (URL, Headers) 列表"""
+    """根据 Key 类型与用户指定的调用通道 (vertex 赠金通道 vs aistudio 普通通道) 构建请求目标"""
+    ch = key_item.get("channel", "")
+    if not ch:
+        ch = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
+    prefer_vertex = ch in ("vertex", "gcli")
+
     if k.startswith("GCLI:"):
         access_token, project_id = await resolve_gcli_token(k, client)
-        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        vx_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        ai_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "x-goog-user-project": project_id,
+            "Content-Type": "application/json"
+        }
         if not model_name:
-            # 兼容获取模型列表请求
-            return []
+            ai_list_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{raw_path}"
+            if query_str:
+                ai_list_url += f"?{query_str}"
+            return [(ai_list_url, ai_headers)]
+
         vx_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
+        ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/models/{model_name}:{action}"
         if query_str:
             vx_url += f"?{query_str}"
-        return [(vx_url, headers)]
+            ai_url += f"?{query_str}"
+
+        if prefer_vertex:
+            return [(vx_url, vx_headers), (ai_url, ai_headers)]
+        else:
+            return [(ai_url, ai_headers), (vx_url, vx_headers)]
 
     headers = {"Content-Type": "application/json"}
     ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{raw_path}?key={k}"
@@ -774,7 +848,7 @@ async def build_targets_for_key(
         vx_url = f"{VERTEX_BASE_URL}/models/{model_name}:{action}?key={k}"
         if query_str:
             vx_url += f"&{query_str}"
-        if key_item.get("channel") == "vertex" or k.startswith("AQ."):
+        if prefer_vertex:
             return [(vx_url, headers), (ai_url, headers)]
         return [(ai_url, headers), (vx_url, headers)]
     return [(ai_url, headers)]
@@ -807,9 +881,8 @@ async def openai_nonstream_via_native_retry(
                     resp = await client.post(url, headers=hdrs, content=gemini_body)
                     if resp.status_code == 200:
                         key_item["success"] = key_item.get("success", 0) + 1
-                        key_item["last_error"] = f"OK ({model_name})"
-                        if "aiplatform.googleapis.com" in url and not k.startswith("GCLI:"):
-                            key_item["channel"] = "vertex"
+                        used_ch = "Vertex" if "aiplatform.googleapis.com" in url else "AIStudio"
+                        key_item["last_error"] = f"OK ({model_name} via {used_ch})"
                         openai_resp = gemini_resp_to_openai(resp.json(), model_name)
                         return JSONResponse(content=openai_resp, status_code=200)
                     else:
@@ -848,9 +921,8 @@ async def openai_stream_via_native_retry(
                         async with client.stream("POST", url, headers=hdrs, content=gemini_body) as resp:
                             if resp.status_code == 200:
                                 key_item["success"] = key_item.get("success", 0) + 1
-                                key_item["last_error"] = f"OK ({model_name})"
-                                if "aiplatform.googleapis.com" in url and not k.startswith("GCLI:"):
-                                    key_item["channel"] = "vertex"
+                                used_ch = "Vertex" if "aiplatform.googleapis.com" in url else "AIStudio"
+                                key_item["last_error"] = f"OK ({model_name} via {used_ch})"
                                 async for line in resp.aiter_lines():
                                     if not line or not line.startswith("data:"):
                                         continue
@@ -914,7 +986,6 @@ async def google_native_proxy(path: str, request: Request):
     model_name = m_match.group(1) if m_match else ""
     action = m_match.group(2) if (m_match and m_match.group(2)) else ""
 
-    # 如果客户端只是请求 /v1beta/models 列表，且池子里只有 GCLI 凭证，直接返回内置完整模型列表
     if path.rstrip("/") == "models" and request.method == "GET":
         non_gcli = [k for k in pool.keys if k.get("enabled", True) and not k["key"].startswith("GCLI:")]
         if not non_gcli:
@@ -1006,9 +1077,8 @@ async def request_with_retry(
                     )
                     if resp.status_code == 200:
                         key_item["success"] = key_item.get("success", 0) + 1
-                        key_item["last_error"] = f"OK ({model_name or 'API'})"
-                        if "aiplatform.googleapis.com" in target_url and not k.startswith("GCLI:"):
-                            key_item["channel"] = "vertex"
+                        used_ch = "Vertex" if "aiplatform.googleapis.com" in target_url else "AIStudio"
+                        key_item["last_error"] = f"OK ({model_name or 'API'} via {used_ch})"
                         return Response(content=resp.content, status_code=200, media_type="application/json")
                     else:
                         last_status = resp.status_code
@@ -1052,9 +1122,8 @@ async def stream_with_retry(
                         ) as resp:
                             if resp.status_code == 200:
                                 key_item["success"] = key_item.get("success", 0) + 1
-                                key_item["last_error"] = f"OK ({model_name or 'stream'})"
-                                if "aiplatform.googleapis.com" in target_url and not k.startswith("GCLI:"):
-                                    key_item["channel"] = "vertex"
+                                used_ch = "Vertex" if "aiplatform.googleapis.com" in target_url else "AIStudio"
+                                key_item["last_error"] = f"OK ({model_name or 'stream'} via {used_ch})"
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
                                 return
@@ -1073,6 +1142,207 @@ async def stream_with_retry(
     yield last_err_bytes
 
 
+GCLOUD_CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
+GCLOUD_CLIENT_SECRET = "d-FL95Q19q7MQmFpd7hHD0Ty"
+GCLOUD_REDIRECT_URI = "https://sdk.cloud.google.com/authn.html"
+_oauth_pkce_store: Dict[str, str] = {}
+
+
+@app.get("/api/admin/oauth/url", dependencies=[Depends(verify_admin)])
+async def admin_get_oauth_url():
+    import hashlib
+    import secrets
+    from urllib.parse import urlencode
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    state = secrets.token_urlsafe(16)
+    _oauth_pkce_store["latest"] = verifier
+    _oauth_pkce_store[state] = verifier
+    params = {
+        "response_type": "code",
+        "client_id": GCLOUD_CLIENT_ID,
+        "redirect_uri": GCLOUD_REDIRECT_URI,
+        "scope": "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/generative-language.retriever",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)}
+
+
+@app.post("/api/admin/oauth/exchange", dependencies=[Depends(verify_admin)])
+async def admin_exchange_oauth(data: Dict[str, str]):
+    from urllib.parse import urlparse, parse_qs
+    raw_code = data.get("code", "").strip()
+    note_input = data.get("note", "").strip()
+    prefer_mode = data.get("mode", "auto").strip()  # vertex / aistudio / auto
+    if not raw_code:
+        raise HTTPException(status_code=400, detail="请粘贴授权码或完整回调链接")
+
+    state = ""
+    if "code=" in raw_code:
+        parsed = urlparse(raw_code)
+        qs = parse_qs(parsed.query)
+        code = qs.get("code", [raw_code])[0]
+        state = qs.get("state", [""])[0]
+    else:
+        code = raw_code
+
+    verifier = _oauth_pkce_store.get(state) or _oauth_pkce_store.get("latest") or ""
+
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        tok_payload = {
+            "client_id": GCLOUD_CLIENT_ID,
+            "client_secret": GCLOUD_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": GCLOUD_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        }
+        if verifier:
+            tok_payload["code_verifier"] = verifier
+
+        r_tok = await client.post("https://oauth2.googleapis.com/token", data=tok_payload)
+        if r_tok.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"换取 Token 失败: {r_tok.text[:150]}")
+        tok = r_tok.json()
+        access_token = tok.get("access_token", "")
+        refresh_token = tok.get("refresh_token", "")
+        if not refresh_token:
+            raise HTTPException(status_code=400, detail="未获取到 refresh_token，请重新点击第1步链接并确保勾选全部权限")
+
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+        # 获取谷歌邮箱用于自动备注
+        email = ""
+        try:
+            r_info = await client.get("https://www.googleapis.com/oauth2/v2/userinfo", headers=headers)
+            if r_info.status_code == 200:
+                email = r_info.json().get("email", "")
+        except Exception:
+            pass
+
+        # 1. 自动扫描该账号下所有活跃的 Google Cloud 项目
+        r_proj = await client.get(
+            "https://cloudresourcemanager.googleapis.com/v1/projects?filter=lifecycleState:ACTIVE",
+            headers=headers
+        )
+        projects = []
+        if r_proj.status_code == 200:
+            projects = r_proj.json().get("projects", [])
+
+        if not projects:
+            raise HTTPException(
+                status_code=400,
+                detail="该账号下还没有任何 Google Cloud 项目！请先在 Google AI Studio 或 Cloud Console 点一下创建项目。"
+            )
+
+        # 2. 自动为项目开启 Vertex AI API 与 Generative Language API (普通 AI Studio)
+        chosen_pid = projects[0].get("projectId", "")
+        test_body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
+        working_model = ""
+        chosen_channel = "vertex"
+        chosen_tier = "pro"
+
+        for p in projects[:5]:
+            pid = p.get("projectId", "")
+            if not pid:
+                continue
+            for svc in ["aiplatform.googleapis.com", "generativelanguage.googleapis.com"]:
+                try:
+                    await client.post(
+                        f"https://serviceusage.googleapis.com/v1/projects/{pid}/services/{svc}:enable",
+                        headers=headers,
+                        json={}
+                    )
+                except Exception:
+                    pass
+
+            # 如果用户指定不想用赠金 (aistudio 普通模式)，优先测普通 AI Studio 通道
+            if prefer_mode == "aistudio":
+                ai_hdrs = {**headers, "x-goog-user-project": pid}
+                for m in ["gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                    r_a = await client.post(f"{GOOGLE_BASE_URL}/v1beta/models/{m}:generateContent", headers=ai_hdrs, json=test_body)
+                    if r_a.status_code == 200:
+                        chosen_pid = pid
+                        working_model = m
+                        chosen_channel = "aistudio"
+                        chosen_tier = "free"
+                        break
+                if working_model:
+                    break
+
+            # 测 Vertex 赠金通道
+            for m in ["gemini-2.5-pro", "gemini-2.5-flash"]:
+                v_url = f"https://aiplatform.googleapis.com/v1/projects/{pid}/locations/global/publishers/google/models/{m}:generateContent"
+                r_test = await client.post(v_url, headers=headers, json=test_body)
+                if r_test.status_code == 200:
+                    chosen_pid = pid
+                    working_model = m
+                    chosen_channel = "vertex"
+                    chosen_tier = "pro" if "pro" in m else "free"
+                    break
+            if working_model:
+                break
+
+            # 如果 Vertex 没开通计费 (纯免费小号)，自动回退测试普通 AI Studio 免费通道！
+            ai_hdrs = {**headers, "x-goog-user-project": pid}
+            for m in ["gemini-3-flash-preview", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                r_a = await client.post(f"{GOOGLE_BASE_URL}/v1beta/models/{m}:generateContent", headers=ai_hdrs, json=test_body)
+                if r_a.status_code == 200:
+                    chosen_pid = pid
+                    working_model = m
+                    chosen_channel = "aistudio"
+                    chosen_tier = "free"
+                    break
+            if working_model:
+                break
+
+        if prefer_mode in ("vertex", "aistudio"):
+            chosen_channel = prefer_mode
+            if prefer_mode == "aistudio" and not working_model:
+                chosen_tier = "free"
+
+        cred_obj = {
+            "client_id": GCLOUD_CLIENT_ID,
+            "client_secret": GCLOUD_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+            "type": "authorized_user",
+            "project_id": chosen_pid,
+        }
+        gcli_key = "GCLI:" + base64.urlsafe_b64encode(json.dumps(cred_obj).encode("utf-8")).decode("utf-8")
+        final_note = note_input or (f"{email} ({chosen_pid})" if email else f"Google授权号 ({chosen_pid})")
+        ch_label = "🏛️Vertex赠金通道" if chosen_channel == "vertex" else "🌱普通AIStudio通道"
+
+        existing = next((item for item in pool.keys if item["key"] == gcli_key), None)
+        if not existing:
+            pool.keys.append({
+                "key": gcli_key,
+                "tier": chosen_tier,
+                "channel": chosen_channel,
+                "note": final_note,
+                "enabled": True,
+                "success": 1 if working_model else 0,
+                "fail": 0,
+                "last_error": f"✅ 已绑定 {ch_label} ({working_model or chosen_pid})",
+                "last_used": time.strftime("%H:%M:%S")
+            })
+        else:
+            existing["note"] = final_note
+            existing["channel"] = chosen_channel
+            existing["tier"] = chosen_tier
+            existing["enabled"] = True
+            existing["last_error"] = f"✅ 已绑定 {ch_label} ({working_model or chosen_pid})"
+        pool.save()
+
+        return {
+            "ok": True,
+            "msg": f"🎉 登录并绑定成功！项目【{chosen_pid}】已设为【{ch_label}】（你随时可以在下方列表里点击通道标签手动切换是否消耗赠金）！"
+        }
+
+
 # ==================== 3. 可视化中文管理面板 ====================
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1084,7 +1354,7 @@ INDEX_HTML = """<!DOCTYPE html>
   :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6; --success: #10b981; --danger: #ef4444; --gold: #f59e0b; }
   * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
   body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
-  .container { max-width: 1040px; margin: 0 auto; }
+  .container { max-width: 1080px; margin: 0 auto; }
   .card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }
   h1, h2, h3 { margin-top: 0; }
   input, textarea, select { width: 100%; background: #0f172a; border: 1px solid #334155; color: var(--text); padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; }
@@ -1100,6 +1370,8 @@ INDEX_HTML = """<!DOCTYPE html>
   .badge.off { background: rgba(239,68,68,0.2); color: #f87171; }
   .badge.pro { background: rgba(245,158,11,0.2); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); cursor: pointer; }
   .badge.free { background: rgba(56,189,248,0.2); color: #38bdf8; border: 1px solid rgba(56,189,248,0.4); cursor: pointer; }
+  .badge.vx { background: rgba(168,85,247,0.2); color: #c084fc; border: 1px solid rgba(168,85,247,0.4); cursor: pointer; }
+  .badge.ai { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid rgba(16,185,129,0.4); cursor: pointer; }
   .code-box { background: #090d16; padding: 10px 14px; border-radius: 8px; font-family: monospace; color: #38bdf8; word-break: break-all; margin: 6px 0; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
   .stat { background: #0f172a; padding: 14px; border-radius: 8px; border: 1px solid #334155; }
@@ -1132,16 +1404,36 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h3>📌 酒馆 (SillyTavern) 填写指南（两种模式均已 100% 兼容 <code>AQ.</code> 密钥 & 强制密码保护）</h3>
+      <h3>📌 酒馆 (SillyTavern) 填写指南（两种模式均已 100% 兼容 <code>GCLI:</code> / <code>AQ.</code> / <code>AIza</code> 密钥 & 强制密码保护）</h3>
       <p style="margin:4px 0;color:var(--muted);font-size:14px;">1. <b>Google AI Studio 原生模式（强烈推荐，支持全部原生参数与思考链）</b>：在酒馆选 <code>Chat Completion</code> -> <code>Google AI Studio</code>，反向代理地址 (Reverse Proxy) 填：</p>
       <div class="code-box" id="googleUrl"></div>
-      <p style="margin:8px 0 4px;color:var(--muted);font-size:14px;">2. <b>OpenAI 兼容模式（底层已内置 <code>?key=</code> 转换器，<code>AQ.</code> 密钥绝不报 401）</b>：在酒馆选 <code>Custom (OpenAI-compatible)</code>，API Endpoint 填：</p>
+      <p style="margin:8px 0 4px;color:var(--muted);font-size:14px;">2. <b>OpenAI 兼容模式（底层已内置原生转换器，<code>GCLI:</code> 与 <code>AQ.</code> 密钥绝不报 401）</b>：在酒馆选 <code>Custom (OpenAI-compatible)</code>，API Endpoint 填：</p>
       <div class="code-box" id="openaiUrl"></div>
       <p style="margin:6px 0 0;color:#fbbf24;font-size:13px;">🔒 <b>安全锁已开启</b>：酒馆里的 <b>反向代理密码 / API Key</b> 必须填你的<b>面板管理密码</b>，不填或填错会被直接拦截，防止别人偷刷你的赠金！</p>
     </div>
 
+    <div class="card" style="border: 1px solid rgba(245,158,11,0.5);">
+      <h3>🌐 方式一：Google 账号网页一键授权登录（赠金大号 & 免费小号通用，全自动查项目 ID！）</h3>
+      <p style="margin:4px 0 12px;color:var(--muted);font-size:13px;">
+        无需开黑框！支持<b>40刀/300刀赠金号</b>（直接走 Vertex 花赠金，全系列 Pro/Flash 通吃），也支持<b>纯免费小号</b>（自动走普通 AI Studio 免费通道）。绑定后还可在下方列表随时一键切换是否用赠金！
+      </p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+        <button class="gold" onclick="startGoogleOAuth()">1️⃣ 第一步：点击打开 Google 登录授权页（勾选“全选”并继续）</button>
+        <select id="oauthModeSelect" style="width:auto;margin:0;">
+          <option value="auto">🤖 自动检测（有赠金走Vertex，免费小号走普通通道）</option>
+          <option value="vertex">🏛️ 强制走 Vertex 赠金通道（花 GCP 赠金，支持 Pro）</option>
+          <option value="aistudio">🌱 强制走普通 AI Studio 通道（不用赠金，走免费额度）</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <input type="text" id="oauthCodeInput" placeholder="2️⃣ 第二步：把谷歌页面最后给你的授权码 (4/0A...) 粘贴到这里" style="margin:0;flex:2;min-width:240px;">
+        <input type="text" id="oauthNoteInput" placeholder="备注（选填，留空自动填谷歌邮箱）" style="margin:0;flex:1;min-width:160px;">
+        <button id="oauthBtn" onclick="submitGoogleOAuth()" style="white-space:nowrap;background:#10b981;">3️⃣ 一键自动查项目 & 入池</button>
+      </div>
+    </div>
+
     <div class="card">
-      <h3>➕ 批量添加 API Key（支持 <code>AQ.</code> 开头与 <code>AIza</code> 开头）</h3>
+      <h3>➕ 方式二：批量粘贴 API Key（支持 <code>GCLI:</code> 凭证、<code>AQ.</code> 开头与 <code>AIza</code> 开头）</h3>
       <div style="display:grid;grid-template-columns: 1fr 1fr;gap:12px;">
         <div>
           <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px;">选择账号层级分组：</label>
@@ -1155,13 +1447,13 @@ INDEX_HTML = """<!DOCTYPE html>
           <input type="text" id="newNote" placeholder="例如：大号赠金300刀 / 小号免费">
         </div>
       </div>
-      <textarea id="newKeys" rows="3" placeholder="一行一个 API Key，例如：\nAQ.xxxxxxxxxxxxxxxxx#赠金号1\nAIzaSyxxxxxxxxxxxxxxx#免费小号"></textarea>
+      <textarea id="newKeys" rows="3" placeholder="一行一个 API Key，例如：\nGCLI:eyJxxxxxxxxxxxxxx#40刀赠金号\nAIzaSyxxxxxxxxxxxxxxx#免费小号"></textarea>
       <button onclick="addKeys()">添加到轮询池</button>
     </div>
 
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-        <h3>🔑 当前 Key 轮询池（点击层级标签可直接切换 💎Pro / ⚡Free）</h3>
+        <h3>🔑 当前 Key 轮询池（点击「层级」或「调用通道」标签均可随时手动切换！）</h3>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <button onclick="testAllKeys()">⚡ 一键测活 & 自动分池</button>
           <button class="gold" onclick="showExportModal()">📋 一键复制 Render 环境变量 (防重启丢失)</button>
@@ -1183,7 +1475,7 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
       <table>
         <thead>
-          <tr><th>序号</th><th>API Key</th><th>层级分组 (点击可切换)</th><th>备注</th><th>状态</th><th>成功/失败</th><th>最近状态 / 报错</th><th>操作</th></tr>
+          <tr><th>序号</th><th>API Key</th><th>层级分组 (点击切换)</th><th>调用通道 (点击切换是否用赠金)</th><th>备注</th><th>状态</th><th>成功/失败</th><th>最近状态 / 报错</th><th>操作</th></tr>
         </thead>
         <tbody id="keyTable"></tbody>
       </table>
@@ -1209,6 +1501,45 @@ document.getElementById("openaiUrl").innerText = origin + "/v1";
 document.getElementById("googleUrl").innerText = origin;
 
 if (pwd) { checkAndLoad(); }
+
+async function startGoogleOAuth() {
+  const r = await fetch("/api/admin/oauth/url", { headers: {"x-admin-password": pwd} });
+  if (!r.ok) { alert("获取登录链接失败"); return; }
+  const data = await r.json();
+  window.open(data.url, "_blank");
+}
+
+async function submitGoogleOAuth() {
+  const code = document.getElementById("oauthCodeInput").value.trim();
+  const note = document.getElementById("oauthNoteInput").value.trim();
+  const mode = document.getElementById("oauthModeSelect").value;
+  if (!code) { alert("请先粘贴第2步的 Google 授权码！"); return; }
+  const btn = document.getElementById("oauthBtn");
+  const oldText = btn.innerText;
+  btn.innerText = "⏳ 正在自动扫描项目 & 激活通道...";
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/admin/oauth/exchange", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "x-admin-password": pwd},
+      body: JSON.stringify({code, note, mode})
+    });
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      alert(data.msg);
+      document.getElementById("oauthCodeInput").value = "";
+      document.getElementById("oauthNoteInput").value = "";
+      loadStatus();
+    } else {
+      alert("❌ 绑定失败：" + (data.detail || data.msg || "未知错误"));
+    }
+  } catch (e) {
+    alert("请求异常：" + e);
+  } finally {
+    btn.innerText = oldText;
+    btn.disabled = false;
+  }
+}
 
 async function doLogin() {
   const val = document.getElementById("pwdInput").value.trim();
@@ -1285,11 +1616,16 @@ function renderData(data) {
     const tierBadge = isPro
       ? `<span class="badge pro" title="点击切换为免费/Flash池" onclick="switchTier(${item.index})">💎 赠金/Pro池</span>`
       : `<span class="badge free" title="点击切换为赠金/Pro池" onclick="switchTier(${item.index})">⚡ 免费/Flash池</span>`;
+    const isVx = item.channel === "vertex";
+    const chBadge = isVx
+      ? `<span class="badge vx" title="当前走 Vertex 抵扣 GCP 赠金，点击可切换为普通 AIStudio 免费通道" onclick="switchChannel(${item.index})">🏛️ Vertex赠金通道</span>`
+      : `<span class="badge ai" title="当前走普通 AIStudio 通道（不扣Vertex赠金），点击可切换为 Vertex 赠金通道" onclick="switchChannel(${item.index})">🌱 普通AIStudio通道</span>`;
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>#${item.index + 1}</td>
       <td><code>${item.masked_key}</code></td>
       <td>${tierBadge}</td>
+      <td>${chBadge}</td>
       <td style="color:#94a3b8;font-size:13px;cursor:pointer;" title="点击修改备注" onclick="editNote(${item.index}, '${(item.note || '').replace(/'/g, "\\'")}')">
         <span style="border-bottom:1px dashed #64748b;padding-bottom:2px;">${item.note || '✏️ 点击加备注'}</span>
       </td>
@@ -1334,6 +1670,14 @@ async function addKeys() {
 
 async function switchTier(index) {
   await fetch("/api/admin/keys/tier", {
+    method: "POST", headers: {"Content-Type": "application/json", "x-admin-password": pwd},
+    body: JSON.stringify({index})
+  });
+  loadStatus();
+}
+
+async function switchChannel(index) {
+  await fetch("/api/admin/keys/channel", {
     method: "POST", headers: {"Content-Type": "application/json", "x-admin-password": pwd},
     body: JSON.stringify({index})
   });
