@@ -11,8 +11,8 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: PRO_API_KEYS
-        value: ""
+        sync: false
       - key: FREE_API_KEYS
-        value: ""
+        sync: false
       - key: KEEP_ALIVE_URL
-        value: ""
+        sync: false
