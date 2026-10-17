@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DATA_FILE = "config_data.json"
 GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com"
+VERTEX_BASE_URL = "https://aiplatform.googleapis.com/v1/publishers/google"
 
 
 class KeyPool:
@@ -450,7 +451,44 @@ async def admin_test_key(data: Dict[str, Any]):
                 except Exception:
                     flash_err_detail = r_flash.text[:120]
 
-            # 3. 所有型号均无法生成内容 -> 彻底不可用
+            # 3. 如果 AI Studio 报 402 (预付款余额为0，但有GCP赠金) 或 AQ. 绑定的服务账号 Key，自动实测 Google Cloud Vertex AI 通道！
+            vertex_pro_models = ["gemini-2.5-pro", "gemini-1.5-pro"]
+            for vpm in vertex_pro_models:
+                r_vpro = await client.post(
+                    f"{VERTEX_BASE_URL}/models/{vpm}:generateContent",
+                    params={"key": key},
+                    json=test_body
+                )
+                if r_vpro.status_code == 200:
+                    item["tier"] = "pro"
+                    item["channel"] = "vertex"
+                    item["enabled"] = True
+                    item["last_error"] = f"✅ Vertex通道可跑 {vpm} (💎GCP赠金池)"
+                    pool.save()
+                    return {
+                        "ok": True,
+                        "msg": f"🎉 测活成功！已通过 Google Cloud Vertex AI 通道激活 {vpm}（绕过AI Studio 402限制，直接抵扣GCP赠金），归入【💎 赠金/Pro池】！"
+                    }
+
+            vertex_flash_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+            for vfm in vertex_flash_models:
+                r_vflash = await client.post(
+                    f"{VERTEX_BASE_URL}/models/{vfm}:generateContent",
+                    params={"key": key},
+                    json=test_body
+                )
+                if r_vflash.status_code == 200:
+                    item["tier"] = "free"
+                    item["channel"] = "vertex"
+                    item["enabled"] = True
+                    item["last_error"] = f"✅ Vertex通道可跑 {vfm} (⚡GCP池)"
+                    pool.save()
+                    return {
+                        "ok": True,
+                        "msg": f"⚡ 测活成功！已通过 Vertex AI 通道激活 {vfm}，归入【⚡ 免费/Flash池】！"
+                    }
+
+            # 4. 所有通道与型号均无法生成内容 -> 彻底不可用
             item["enabled"] = False
             err_msg = f"❌ 不可用已暂停 (HTTP {last_flash_status}): {(flash_err_detail or pro_err_detail)[:120]}"
             item["last_error"] = err_msg
@@ -637,28 +675,34 @@ async def openai_nonstream_via_native_retry(
         for key_item in candidates:
             k = key_item["key"]
             key_item["last_used"] = time.strftime("%H:%M:%S")
-            url = f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:generateContent?key={k}"
-            try:
-                resp = await client.post(url, headers={"Content-Type": "application/json"}, content=gemini_body)
-                if resp.status_code == 200:
-                    key_item["success"] = key_item.get("success", 0) + 1
-                    key_item["last_error"] = f"OK ({model_name})"
-                    openai_resp = gemini_resp_to_openai(resp.json(), model_name)
-                    return JSONResponse(content=openai_resp, status_code=200)
-                else:
-                    key_item["fail"] = key_item.get("fail", 0) + 1
-                    key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {resp.text[:100]}"
-                    last_status = resp.status_code
-                    last_err_text = resp.text
-                    if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
-                        continue
+            is_vertex = key_item.get("channel") == "vertex" or k.startswith("AQ.")
+            urls_to_try = (
+                [f"{VERTEX_BASE_URL}/models/{model_name}:generateContent?key={k}",
+                 f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:generateContent?key={k}"]
+                if is_vertex else
+                [f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:generateContent?key={k}",
+                 f"{VERTEX_BASE_URL}/models/{model_name}:generateContent?key={k}"]
+            )
+            for url in urls_to_try:
+                try:
+                    resp = await client.post(url, headers={"Content-Type": "application/json"}, content=gemini_body)
+                    if resp.status_code == 200:
+                        key_item["success"] = key_item.get("success", 0) + 1
+                        key_item["last_error"] = f"OK ({model_name})"
+                        if "aiplatform.googleapis.com" in url:
+                            key_item["channel"] = "vertex"
+                        openai_resp = gemini_resp_to_openai(resp.json(), model_name)
+                        return JSONResponse(content=openai_resp, status_code=200)
                     else:
-                        break
-            except Exception as e:
-                key_item["fail"] = key_item.get("fail", 0) + 1
-                key_item["last_error"] = str(e)[:100]
-                last_err_text = str(e)
-                continue
+                        last_status = resp.status_code
+                        last_err_text = resp.text
+                        if resp.status_code in (402, 403, 401, 404):
+                            continue
+                except Exception as e:
+                    last_err_text = str(e)
+                    continue
+            key_item["fail"] = key_item.get("fail", 0) + 1
+            key_item["last_error"] = f"[{model_name}] HTTP {last_status}: {last_err_text[:100]}"
     return JSONResponse(status_code=last_status, content={"error": {"message": last_err_text}})
 
 
@@ -674,69 +718,75 @@ async def openai_stream_via_native_retry(
     for key_item in candidates:
         k = key_item["key"]
         key_item["last_used"] = time.strftime("%H:%M:%S")
-        url = f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={k}"
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    content=gemini_body
-                ) as resp:
-                    if resp.status_code == 200:
-                        key_item["success"] = key_item.get("success", 0) + 1
-                        key_item["last_error"] = f"OK ({model_name})"
-                        async for line in resp.aiter_lines():
-                            if not line or not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if not data_str or data_str == "[DONE]":
-                                continue
-                            try:
-                                g_chunk = json.loads(data_str)
-                                cands = g_chunk.get("candidates", [])
-                                if cands:
-                                    parts = cands[0].get("content", {}).get("parts", [])
-                                    text_piece = "".join(p.get("text", "") for p in parts if "text" in p)
-                                    if text_piece:
-                                        oai_chunk = {
-                                            "id": chat_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created,
-                                            "model": model_name,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": text_piece},
-                                                "finish_reason": None
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
-                            except Exception:
-                                continue
-                        done_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                        }
-                        yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
-                        return
-                    else:
-                        err_body = await resp.aread()
-                        err_str = err_body.decode("utf-8", "ignore")
-                        key_item["fail"] = key_item.get("fail", 0) + 1
-                        key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {err_str[:100]}"
-                        last_err = err_str
-                        if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
-                            continue
+        is_vertex = key_item.get("channel") == "vertex" or k.startswith("AQ.")
+        urls_to_try = (
+            [f"{VERTEX_BASE_URL}/models/{model_name}:streamGenerateContent?alt=sse&key={k}",
+             f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={k}"]
+            if is_vertex else
+            [f"{GOOGLE_BASE_URL}/v1beta/models/{model_name}:streamGenerateContent?alt=sse&key={k}",
+             f"{VERTEX_BASE_URL}/models/{model_name}:streamGenerateContent?alt=sse&key={k}"]
+        )
+        for url in urls_to_try:
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        "POST",
+                        url,
+                        headers={"Content-Type": "application/json"},
+                        content=gemini_body
+                    ) as resp:
+                        if resp.status_code == 200:
+                            key_item["success"] = key_item.get("success", 0) + 1
+                            key_item["last_error"] = f"OK ({model_name})"
+                            if "aiplatform.googleapis.com" in url:
+                                key_item["channel"] = "vertex"
+                            async for line in resp.aiter_lines():
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                data_str = line[5:].strip()
+                                if not data_str or data_str == "[DONE]":
+                                    continue
+                                try:
+                                    g_chunk = json.loads(data_str)
+                                    cands = g_chunk.get("candidates", [])
+                                    if cands:
+                                        parts = cands[0].get("content", {}).get("parts", [])
+                                        text_piece = "".join(p.get("text", "") for p in parts if "text" in p)
+                                        if text_piece:
+                                            oai_chunk = {
+                                                "id": chat_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created,
+                                                "model": model_name,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {"content": text_piece},
+                                                    "finish_reason": None
+                                                }]
+                                            }
+                                            yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                except Exception:
+                                    continue
+                            done_chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                            }
+                            yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                            return
                         else:
-                            break
-        except Exception as e:
-            key_item["fail"] = key_item.get("fail", 0) + 1
-            key_item["last_error"] = str(e)[:100]
-            last_err = str(e)
-            continue
+                            err_body = await resp.aread()
+                            err_str = err_body.decode("utf-8", "ignore")
+                            last_err = err_str
+                            if resp.status_code in (402, 403, 401, 404):
+                                continue
+            except Exception as e:
+                last_err = str(e)
+                continue
+        key_item["fail"] = key_item.get("fail", 0) + 1
+        key_item["last_error"] = f"[{model_name}] {last_err[:100]}"
 
     err_payload = {"error": {"message": last_err}}
     yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
@@ -761,11 +811,19 @@ async def google_native_proxy(path: str, request: Request):
     query_items = [(k, v) for k, v in request.query_params.multi_items() if k.lower() != "key"]
     query_str = "&".join([f"{k}={v}" for k, v in query_items])
 
-    def build_url(api_key: str) -> str:
-        base = f"{GOOGLE_BASE_URL}/{version_prefix}/{path}?key={api_key}"
+    def build_urls_for_item(key_item: Dict[str, Any]) -> List[str]:
+        api_key = key_item["key"]
+        ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{path}?key={api_key}"
         if query_str:
-            base += f"&{query_str}"
-        return base
+            ai_url += f"&{query_str}"
+        if path.startswith("models/") and (":" in path):
+            vx_url = f"{VERTEX_BASE_URL}/{path}?key={api_key}"
+            if query_str:
+                vx_url += f"&{query_str}"
+            if key_item.get("channel") == "vertex":
+                return [vx_url, ai_url]
+            return [ai_url, vx_url]
+        return [ai_url]
 
     is_stream = "streamGenerateContent" in path or request.query_params.get("alt") == "sse"
     candidates = candidates[:min(len(candidates), 6)]
@@ -775,7 +833,7 @@ async def google_native_proxy(path: str, request: Request):
         return StreamingResponse(
             stream_with_retry(
                 method=request.method,
-                url_builder=build_url,
+                urls_builder=build_urls_for_item,
                 headers_builder=lambda k: {"Content-Type": "application/json"},
                 body=body,
                 candidates=candidates,
@@ -786,7 +844,7 @@ async def google_native_proxy(path: str, request: Request):
     else:
         return await request_with_retry(
             method=request.method,
-            url_builder=build_url,
+            urls_builder=build_urls_for_item,
             headers_builder=lambda k: {"Content-Type": "application/json"},
             body=body,
             candidates=candidates,
@@ -796,7 +854,7 @@ async def google_native_proxy(path: str, request: Request):
 
 async def request_with_retry(
     method: str,
-    url_builder,
+    urls_builder,
     headers_builder,
     body: bytes,
     candidates: List[Dict[str, Any]],
@@ -808,37 +866,36 @@ async def request_with_retry(
         for key_item in candidates:
             k = key_item["key"]
             key_item["last_used"] = time.strftime("%H:%M:%S")
-            try:
-                resp = await client.request(
-                    method=method,
-                    url=url_builder(k),
-                    headers=headers_builder(k),
-                    content=body if method != "GET" else None
-                )
-                if resp.status_code == 200:
-                    key_item["success"] = key_item.get("success", 0) + 1
-                    key_item["last_error"] = f"OK ({model_name or 'API'})"
-                    return Response(content=resp.content, status_code=200, media_type="application/json")
-                else:
-                    key_item["fail"] = key_item.get("fail", 0) + 1
-                    key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {resp.text[:100]}"
-                    last_status = resp.status_code
-                    last_content = resp.content
-                    if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
-                        continue
+            for target_url in urls_builder(key_item):
+                try:
+                    resp = await client.request(
+                        method=method,
+                        url=target_url,
+                        headers=headers_builder(k),
+                        content=body if method != "GET" else None
+                    )
+                    if resp.status_code == 200:
+                        key_item["success"] = key_item.get("success", 0) + 1
+                        key_item["last_error"] = f"OK ({model_name or 'API'})"
+                        if "aiplatform.googleapis.com" in target_url:
+                            key_item["channel"] = "vertex"
+                        return Response(content=resp.content, status_code=200, media_type="application/json")
                     else:
-                        return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-            except Exception as e:
-                key_item["fail"] = key_item.get("fail", 0) + 1
-                key_item["last_error"] = str(e)[:100]
-                last_content = json.dumps({"error": str(e)}).encode("utf-8")
-                continue
+                        last_status = resp.status_code
+                        last_content = resp.content
+                        if resp.status_code in (402, 403, 401, 404):
+                            continue
+                except Exception as e:
+                    last_content = json.dumps({"error": str(e)}).encode("utf-8")
+                    continue
+            key_item["fail"] = key_item.get("fail", 0) + 1
+            key_item["last_error"] = f"[{model_name}] HTTP {last_status}: {last_content.decode('utf-8', 'ignore')[:100]}"
     return Response(content=last_content, status_code=last_status, media_type="application/json")
 
 
 async def stream_with_retry(
     method: str,
-    url_builder,
+    urls_builder,
     headers_builder,
     body: bytes,
     candidates: List[Dict[str, Any]],
@@ -848,35 +905,33 @@ async def stream_with_retry(
     for key_item in candidates:
         k = key_item["key"]
         key_item["last_used"] = time.strftime("%H:%M:%S")
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    method=method,
-                    url=url_builder(k),
-                    headers=headers_builder(k),
-                    content=body if method != "GET" else None
-                ) as resp:
-                    if resp.status_code == 200:
-                        key_item["success"] = key_item.get("success", 0) + 1
-                        key_item["last_error"] = f"OK ({model_name or 'stream'})"
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                        return
-                    else:
-                        err_body = await resp.aread()
-                        key_item["fail"] = key_item.get("fail", 0) + 1
-                        key_item["last_error"] = f"[{model_name}] HTTP {resp.status_code}: {err_body.decode('utf-8', 'ignore')[:100]}"
-                        last_err_bytes = err_body
-                        if resp.status_code in (404, 429, 401, 403, 500, 502, 503, 504):
-                            continue
-                        else:
-                            yield err_body
+        for target_url in urls_builder(key_item):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        method=method,
+                        url=target_url,
+                        headers=headers_builder(k),
+                        content=body if method != "GET" else None
+                    ) as resp:
+                        if resp.status_code == 200:
+                            key_item["success"] = key_item.get("success", 0) + 1
+                            key_item["last_error"] = f"OK ({model_name or 'stream'})"
+                            if "aiplatform.googleapis.com" in target_url:
+                                key_item["channel"] = "vertex"
+                            async for chunk in resp.aiter_bytes():
+                                yield chunk
                             return
-        except Exception as e:
-            key_item["fail"] = key_item.get("fail", 0) + 1
-            key_item["last_error"] = str(e)[:100]
-            last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
-            continue
+                        else:
+                            err_body = await resp.aread()
+                            last_err_bytes = err_body
+                            if resp.status_code in (402, 403, 401, 404):
+                                continue
+            except Exception as e:
+                last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
+                continue
+        key_item["fail"] = key_item.get("fail", 0) + 1
+        key_item["last_error"] = f"[{model_name}] {last_err_bytes.decode('utf-8', 'ignore')[:100]}"
     yield last_err_bytes
 
 
