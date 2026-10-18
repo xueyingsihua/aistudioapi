@@ -440,22 +440,39 @@ async def admin_change_password(data: Dict[str, str]):
 
 
 def ensure_vertex_role(body_bytes: bytes) -> bytes:
-    """Vertex AI 强制要求 contents 里的每一项都有 role 字段，若酒馆原生请求未带 role 则自动补上 user"""
+    """自动补齐 role 字段 + 强制注入 BLOCK_NONE 防拦截 + 自动扩容 8192 防截断"""
     if not body_bytes:
         return body_bytes
     try:
         data = json.loads(body_bytes)
-        changed = False
-        if isinstance(data, dict) and isinstance(data.get("contents"), list):
+        if not isinstance(data, dict):
+            return body_bytes
+
+        # 1. Vertex AI 强制要求 contents 里的每一项都有 role 字段
+        if isinstance(data.get("contents"), list):
             for c in data["contents"]:
                 if isinstance(c, dict) and "role" not in c:
                     c["role"] = "user"
-                    changed = True
-        if changed:
-            return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+        # 2. 原生模式也强制注入 BLOCK_NONE，彻底告别无预设拦截
+        data["safetySettings"] = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+        ]
+
+        # 3. 防截断保护：如果酒馆或旧预设把最大回复限制得太小 (<8192)，自动扩容到 8192
+        gen_cfg = data.setdefault("generationConfig", {})
+        if isinstance(gen_cfg, dict):
+            cur_max = gen_cfg.get("maxOutputTokens", 0)
+            if not cur_max or cur_max < 8192:
+                gen_cfg["maxOutputTokens"] = 8192
+
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
     except Exception:
-        pass
-    return body_bytes
+        return body_bytes
 
 
 @app.post("/api/admin/keys/test", dependencies=[Depends(verify_admin)])
@@ -695,14 +712,11 @@ def openai_req_to_gemini(payload: Dict[str, Any]) -> Dict[str, Any]:
         gen_cfg["temperature"] = payload["temperature"]
     if "top_p" in payload and payload["top_p"] is not None:
         gen_cfg["topP"] = payload["top_p"]
-    if "max_tokens" in payload and payload["max_tokens"] is not None:
-        gen_cfg["maxOutputTokens"] = payload["max_tokens"]
-    elif "max_completion_tokens" in payload and payload["max_completion_tokens"] is not None:
-        gen_cfg["maxOutputTokens"] = payload["max_completion_tokens"]
+    raw_max = payload.get("max_tokens") or payload.get("max_completion_tokens") or 0
+    gen_cfg["maxOutputTokens"] = max(int(raw_max), 8192) if raw_max else 8192
     if "stop" in payload and payload["stop"]:
         gen_cfg["stopSequences"] = payload["stop"] if isinstance(payload["stop"], list) else [payload["stop"]]
-    if gen_cfg:
-        gemini_body["generationConfig"] = gen_cfg
+    gemini_body["generationConfig"] = gen_cfg
 
     # 默认放宽安全过滤，非常适合酒馆 RP 使用
     gemini_body["safetySettings"] = [
@@ -722,7 +736,7 @@ def gemini_resp_to_openai(gemini_data: Dict[str, Any], model_name: str) -> Dict[
     if candidates:
         cand = candidates[0]
         parts = cand.get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts if "text" in p)
+        text = "".join(p.get("text", "") for p in parts if "text" in p and not p.get("thought"))
         fr = cand.get("finishReason", "")
         if fr == "MAX_TOKENS":
             finish_reason = "length"
@@ -976,7 +990,7 @@ async def openai_stream_via_native_retry(
                                         cands = g_chunk.get("candidates", [])
                                         if cands:
                                             parts = cands[0].get("content", {}).get("parts", [])
-                                            text_piece = "".join(p.get("text", "") for p in parts if "text" in p)
+                                            text_piece = "".join(p.get("text", "") for p in parts if "text" in p and not p.get("thought"))
                                             if text_piece:
                                                 oai_chunk = {
                                                     "id": chat_id,
@@ -1401,15 +1415,17 @@ INDEX_HTML = """<!DOCTYPE html>
   .container { max-width: 1080px; margin: 0 auto; }
   .card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }
   h1, h2, h3 { margin-top: 0; }
-  input, textarea, select { width: 100%; background: #0f172a; border: 1px solid #334155; color: var(--text); padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; }
-  button { background: var(--primary); color: white; border: none; padding: 9px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+  input, textarea, select { width: 100%; background: #0f172a; border: 1px solid #334155; color: var(--text); padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; max-width: 100%; }
+  button { background: var(--primary); color: white; border: none; padding: 9px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; white-space: nowrap; }
   button:hover { opacity: 0.9; }
   button.danger { background: var(--danger); }
   button.secondary { background: #475569; }
   button.gold { background: #d97706; }
+  .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
-  th, td { text-align: left; padding: 10px; border-bottom: 1px solid #334155; }
-  .badge { padding: 4px 9px; border-radius: 99px; font-size: 12px; font-weight: 600; display: inline-block; }
+  th, td { text-align: left; padding: 10px; border-bottom: 1px solid #334155; vertical-align: middle; }
+  th { white-space: nowrap; color: #cbd5e1; }
+  .badge { padding: 4px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; display: inline-block; white-space: nowrap; }
   .badge.ok { background: rgba(16,185,129,0.2); color: #34d399; }
   .badge.off { background: rgba(239,68,68,0.2); color: #f87171; }
   .badge.pro { background: rgba(245,158,11,0.2); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); cursor: pointer; }
@@ -1417,9 +1433,55 @@ INDEX_HTML = """<!DOCTYPE html>
   .badge.vx { background: rgba(168,85,247,0.2); color: #c084fc; border: 1px solid rgba(168,85,247,0.4); cursor: pointer; }
   .badge.ai { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid rgba(16,185,129,0.4); cursor: pointer; }
   .code-box { background: #090d16; padding: 10px 14px; border-radius: 8px; font-family: monospace; color: #38bdf8; word-break: break-all; margin: 6px 0; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
   .stat { background: #0f172a; padding: 14px; border-radius: 8px; border: 1px solid #334155; }
-  .stat-val { font-size: 22px; font-weight: bold; color: #60a5fa; margin-top: 4px; }
+  .stat-val { font-size: 20px; font-weight: bold; color: #60a5fa; margin-top: 4px; }
+  .form-two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .act-btns { display: flex; gap: 6px; align-items: center; }
+
+  /* 手机端自适应卡片布局，告别竖排挤成一团 */
+  @media (max-width: 768px) {
+    body { padding: 10px; }
+    .card { padding: 14px; margin-bottom: 14px; }
+    h2 { font-size: 18px; }
+    h3 { font-size: 15px; }
+    .grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat { padding: 10px; }
+    .stat-val { font-size: 17px; }
+    .form-two-col { grid-template-columns: 1fr; gap: 0; }
+    button { white-space: normal; line-height: 1.3; }
+    table, thead, tbody, th, td, tr { display: block; }
+    thead tr { display: none; }
+    tbody tr {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    tbody td {
+      border-bottom: 1px solid rgba(51,65,85,0.5);
+      padding: 7px 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      text-align: right;
+      word-break: break-word;
+    }
+    tbody td:last-child { border-bottom: none; padding-top: 10px; }
+    tbody td::before {
+      content: attr(data-label);
+      font-weight: 600;
+      color: #94a3b8;
+      font-size: 12px;
+      white-space: nowrap;
+      text-align: left;
+      flex-shrink: 0;
+    }
+    .act-btns { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+    .act-btns button { white-space: nowrap; flex: 1; text-align: center; padding: 7px 10px !important; }
+  }
 </style>
 </head>
 <body>
@@ -1462,23 +1524,23 @@ INDEX_HTML = """<!DOCTYPE html>
         无需开黑框！支持<b>40刀/300刀赠金号</b>（直接走 Vertex 花赠金，全系列 Pro/Flash 通吃），也支持<b>纯免费小号</b>（自动走普通 AI Studio 免费通道）。绑定后还可在下方列表随时一键切换是否用赠金！
       </p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
-        <button class="gold" onclick="startGoogleOAuth()">1️⃣ 第一步：点击打开 Google 登录授权页（勾选“全选”并继续）</button>
-        <select id="oauthModeSelect" style="width:auto;margin:0;">
+        <button class="gold" onclick="startGoogleOAuth()" style="flex:1;min-width:220px;">1️⃣ 第一步：点击打开 Google 登录授权页（勾选“全选”并继续）</button>
+        <select id="oauthModeSelect" style="flex:1;min-width:220px;margin:0;">
           <option value="auto">🤖 自动检测（有赠金走Vertex，免费小号走普通通道）</option>
           <option value="vertex">🏛️ 强制走 Vertex 赠金通道（花 GCP 赠金，支持 Pro）</option>
           <option value="aistudio">🌱 强制走普通 AI Studio 通道（不用赠金，走免费额度）</option>
         </select>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
-        <input type="text" id="oauthCodeInput" placeholder="2️⃣ 第二步：把谷歌页面最后给你的授权码 (4/0A...) 粘贴到这里" style="margin:0;flex:2;min-width:240px;">
+        <input type="text" id="oauthCodeInput" placeholder="2️⃣ 第二步：把谷歌页面最后给你的授权码 (4/0A...) 粘贴到这里" style="margin:0;flex:2;min-width:220px;">
         <input type="text" id="oauthNoteInput" placeholder="备注（选填，留空自动填谷歌邮箱）" style="margin:0;flex:1;min-width:160px;">
-        <button id="oauthBtn" onclick="submitGoogleOAuth()" style="white-space:nowrap;background:#10b981;">3️⃣ 一键自动查项目 & 入池</button>
+        <button id="oauthBtn" onclick="submitGoogleOAuth()" style="background:#10b981;flex:1;min-width:180px;">3️⃣ 一键自动查项目 & 入池</button>
       </div>
     </div>
 
     <div class="card">
       <h3>➕ 方式二：批量粘贴 API Key（支持 <code>GCLI:</code> 凭证、<code>AQ.</code> 开头与 <code>AIza</code> 开头）</h3>
-      <div style="display:grid;grid-template-columns: 1fr 1fr;gap:12px;">
+      <div class="form-two-col">
         <div>
           <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px;">选择账号层级分组：</label>
           <select id="newTier">
@@ -1517,19 +1579,21 @@ INDEX_HTML = """<!DOCTYPE html>
           <button class="secondary" style="white-space:nowrap;padding:7px 12px;" onclick="copyText('exportFreeVal')">复制 FREE_API_KEYS</button>
         </div>
       </div>
-      <table>
-        <thead>
-          <tr><th>序号</th><th>API Key</th><th>层级分组 (点击切换)</th><th>调用通道 (点击切换是否用赠金)</th><th>备注</th><th>状态</th><th>成功/失败</th><th>最近状态 / 报错</th><th>操作</th></tr>
-        </thead>
-        <tbody id="keyTable"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>序号</th><th>API Key</th><th>层级分组 (点击切换)</th><th>调用通道 (点击切换)</th><th>备注</th><th>状态</th><th>成功/失败</th><th>最近状态 / 报错</th><th>操作</th></tr>
+          </thead>
+          <tbody id="keyTable"></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="card">
       <h3>💓 Render 自动保活设置（可选，点保存后生效）</h3>
       <p style="color:var(--muted);font-size:14px;">需要 24 小时保活防休眠时，点击<b>「🎯 一键提取当前网址」</b>再点<b>「保存并开启」</b>即可；如果不需要保活（节省每月免费时长），清空输入框点保存即可关闭：</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
-        <input type="text" id="keepAliveInput" placeholder="留空则不开启自动保活" style="margin:0;flex:1;min-width:240px;">
+        <input type="text" id="keepAliveInput" placeholder="留空则不开启自动保活" style="margin:0;flex:1;min-width:220px;">
         <button class="secondary" onclick="fillCurrentUrl()" style="white-space:nowrap;">🎯 一键提取当前网址</button>
         <button onclick="saveKeepAlive()" style="white-space:nowrap;">💾 保存设置</button>
       </div>
@@ -1666,21 +1730,21 @@ function renderData(data) {
       : `<span class="badge ai" title="当前走普通 AIStudio 通道（不扣Vertex赠金），点击可切换为 Vertex 赠金通道" onclick="switchChannel(${item.index})">🌱 普通AIStudio通道</span>`;
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>#${item.index + 1}</td>
-      <td><code>${item.masked_key}</code></td>
-      <td>${tierBadge}</td>
-      <td>${chBadge}</td>
-      <td style="color:#94a3b8;font-size:13px;cursor:pointer;" title="点击修改备注" onclick="editNote(${item.index}, '${(item.note || '').replace(/'/g, "\\'")}')">
+      <td data-label="序号">#${item.index + 1}</td>
+      <td data-label="密钥"><code>${item.masked_key}</code></td>
+      <td data-label="层级分组 (点击切换)">${tierBadge}</td>
+      <td data-label="调用通道 (点击切换)">${chBadge}</td>
+      <td data-label="备注" style="color:#94a3b8;font-size:13px;cursor:pointer;" title="点击修改备注" onclick="editNote(${item.index}, '${(item.note || '').replace(/'/g, "\\'")}')">
         <span style="border-bottom:1px dashed #64748b;padding-bottom:2px;">${item.note || '✏️ 点击加备注'}</span>
       </td>
-      <td><span class="badge ${item.enabled ? 'ok' : 'off'}">${item.enabled ? '启用中' : '已暂停'}</span></td>
-      <td><span style="color:#34d399">${item.success}</span> / <span style="color:#f87171">${item.fail}</span></td>
-      <td style="max-width:230px;word-break:break-all;font-size:12px;color:#cbd5e1;">${item.last_error || '待命'}</td>
-      <td style="display:flex;gap:6px;">
+      <td data-label="状态"><span class="badge ${item.enabled ? 'ok' : 'off'}">${item.enabled ? '启用中' : '已暂停'}</span></td>
+      <td data-label="成功 / 失败"><span style="color:#34d399">${item.success}</span> / <span style="color:#f87171">${item.fail}</span></td>
+      <td data-label="最近状态 / 报错" style="max-width:260px;font-size:12px;color:#cbd5e1;">${item.last_error || '待命'}</td>
+      <td data-label="操作"><div class="act-btns">
         <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="testKey(${item.index})">测活&识别</button>
         <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="toggleKey(${item.index})">${item.enabled ? '暂停' : '启用'}</button>
         <button class="danger" style="padding:5px 10px;font-size:12px;" onclick="deleteKey(${item.index})">删除</button>
-      </td>
+      </div></td>
     `;
     tbody.appendChild(tr);
   });
