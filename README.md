@@ -1,6 +1,8 @@
 # 🍷 酒馆 (SillyTavern) 专属 Gemini / Vertex 赠金智能分池轮询反代
 
-一个专为 **SillyTavern（酒馆）** 打造的超轻量、零门槛、高颜值 **Google Gemini API & Vertex AI 赠金多号轮询反向代理**。支持一键部署到 Render，自带全中文可视化管理面板（完美适配电脑与手机端卡片布局）。
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/xueyingsihua/aistudioapi)
+
+一个专为 **SillyTavern（酒馆）** 打造的超轻量、零门槛、高颜值 **Google Gemini API & Vertex AI 赠金多号轮询反向代理**。支持点击上方按钮一键部署到 Render，自带全中文可视化管理面板（完美适配电脑与手机端卡片布局）。
 
 ---
 
@@ -27,17 +29,25 @@
 
 ---
 
-## 🚀 3 分钟一键部署到 Render（零代码基础）
+## 🚀 3 分钟部署到 Render（零代码基础）
 
+### 方法一：点击按钮全自动一键部署（最简单）
+直接点击下方按钮，登录 Render 即可自动读取本仓库配置并创建服务：
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/xueyingsihua/aistudioapi)
+
+> 💡 **强烈建议**：部署时或部署完成后，在 Render 的 **Environment Variables（环境变量）** 中将 `ADMIN_PASSWORD` 修改为你自己的专属管理密码（默认初始密码为 `123456`）。
+
+### 方法二：Fork 仓库后手动在 Render 创建
 1. **Fork 本仓库** 到你自己的 GitHub 账号下。
 2. 登录 [Render 控制台](https://dashboard.render.com/)，点击右上角 **`New +`** -> **`Web Service`**，连接你刚 Fork 的仓库。
 3. Render 配置项保持默认（或按以下填写）：
-   - **Language / Runtime**：`Python 3`（或 `Docker`）
+   - **Language / Runtime**：`Docker` 或 `Python 3`
    - **Build Command**：`pip install -r requirements.txt`
    - **Start Command**：`uvicorn main:app --host 0.0.0.0 --port $PORT`
    - **Instance Type**：选择 **`Free`**
 4. 在下方 **Environment Variables（环境变量）** 添加：
-   - `ADMIN_PASSWORD`：填入你自己设定的**管理密码**（既是网页后台登录密码，也是酒馆连接时填的 API Key 密码，默认初始为 `123456`，**强烈建议修改！**）
+   - `ADMIN_PASSWORD`：填入你自己设定的**管理密码**（既是网页后台登录密码，也是酒馆连接时填的 API Key 密码，默认初始为 `123456`）
 5. 点击 **`Create Web Service`**，等待 1~2 分钟显示 `Live` 即可打开你的专属反代网址！
 
 ---
