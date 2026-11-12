@@ -184,12 +184,13 @@ class KeyPool:
 
     @staticmethod
     def is_pro_model(model_name: str) -> bool:
-        m = (model_name or "").lower()
-        if "flash" in m or "lite" in m or "embedding" in m or "aqa" in m:
+        m = (model_name or "").lower().strip()
+        if not m:
             return False
-        if "pro" in m or "ultra" in m or "exp" in m or "thinking" in m:
-            return True
-        return False
+        if "flash" in m or "lite" in m or "embedding" in m or "aqa" in m or "gemma" in m:
+            return False
+        # 除 Flash / Lite 以外的所有模型（包括 pro、ultra、thinking 以及 gemini-4-carbon / argon 等新代号模型）一律优先走 💎 赠金/Pro池
+        return True
 
     def get_candidates_for_model(self, model_name: str = "") -> List[Dict[str, Any]]:
         active = [k for k in self.keys if k.get("enabled", True)]
@@ -764,6 +765,8 @@ def gemini_resp_to_openai(gemini_data: Dict[str, Any], model_name: str) -> Dict[
 
 # ==================== 1. OpenAI 兼容接口 (底层全走原生通道，100% 兼容 GCLI: / AQ. / AIza 密钥) ====================
 DEFAULT_FULL_MODELS = [
+    ("gemini-4-argon", "Gemini 4 Argon (Preview)"),
+    ("gemini-4-carbon", "Gemini 4 Carbon (Preview)"),
     ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
     ("gemini-3.1-pro", "Gemini 3.1 Pro"),
     ("gemini-2.5-pro", "Gemini 2.5 Pro"),
@@ -884,16 +887,18 @@ async def build_targets_for_key(
                 ai_list_url += f"?{query_str}"
             return [(ai_list_url, ai_headers)]
 
-        vx_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
+        vx_v1_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
+        vx_beta_url = f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
         ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/models/{model_name}:{action}"
         if query_str:
-            vx_url += f"?{query_str}"
+            vx_v1_url += f"?{query_str}"
+            vx_beta_url += f"?{query_str}"
             ai_url += f"?{query_str}"
 
         if prefer_vertex:
-            return [(vx_url, vx_headers), (ai_url, ai_headers)]
+            return [(vx_beta_url, vx_headers), (vx_v1_url, vx_headers), (ai_url, ai_headers)]
         else:
-            return [(ai_url, ai_headers), (vx_url, vx_headers)]
+            return [(ai_url, ai_headers), (vx_beta_url, vx_headers), (vx_v1_url, vx_headers)]
 
     headers = {"Content-Type": "application/json"}
     ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{raw_path}?key={k}"
@@ -932,6 +937,8 @@ async def openai_nonstream_via_native_retry(
                 key_item["last_error"] = f"OAuth异常: {last_err_text[:80]}"
                 continue
 
+            primary_status = None
+            primary_err_text = None
             for url, hdrs in targets:
                 try:
                     resp = await client.post(url, headers=hdrs, content=gemini_body)
@@ -942,13 +949,20 @@ async def openai_nonstream_via_native_retry(
                         openai_resp = gemini_resp_to_openai(resp.json(), model_name)
                         return JSONResponse(content=openai_resp, status_code=200)
                     else:
-                        last_status = resp.status_code
-                        last_err_text = resp.text
+                        err_t = resp.text
+                        if primary_err_text is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_t:
+                            primary_status = resp.status_code
+                            primary_err_text = err_t
                         if resp.status_code in (402, 403, 401, 404):
                             continue
                 except Exception as e:
-                    last_err_text = str(e)
+                    if primary_err_text is None:
+                        primary_err_text = str(e)
                     continue
+            if primary_status:
+                last_status = primary_status
+            if primary_err_text:
+                last_err_text = primary_err_text
             key_item["fail"] = key_item.get("fail", 0) + 1
             key_item["last_error"] = f"[{model_name}] HTTP {last_status}: {last_err_text[:100]}"
     return JSONResponse(status_code=last_status, content={"error": {"message": last_err_text}})
@@ -966,6 +980,7 @@ async def openai_stream_via_native_retry(
     for key_item in candidates:
         k = key_item["key"]
         key_item["last_used"] = time.strftime("%H:%M:%S")
+        primary_err = None
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 targets = await build_targets_for_key(
@@ -1018,14 +1033,19 @@ async def openai_stream_via_native_retry(
                             else:
                                 err_body = await resp.aread()
                                 err_str = err_body.decode("utf-8", "ignore")
-                                last_err = err_str
+                                if primary_err is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_str:
+                                    primary_err = err_str
                                 if resp.status_code in (402, 403, 401, 404):
                                     continue
                     except Exception as e:
-                        last_err = str(e)
+                        if primary_err is None:
+                            primary_err = str(e)
                         continue
         except Exception as e:
-            last_err = str(e)
+            if primary_err is None:
+                primary_err = str(e)
+        if primary_err:
+            last_err = primary_err
         key_item["fail"] = key_item.get("fail", 0) + 1
         key_item["last_error"] = f"[{model_name}] {last_err[:100]}"
 
@@ -1125,6 +1145,8 @@ async def request_with_retry(
                 key_item["last_error"] = f"OAuth异常: {str(e)[:80]}"
                 continue
 
+            primary_status = None
+            primary_content = None
             for target_url, hdrs in targets:
                 try:
                     resp = await client.request(
@@ -1139,13 +1161,20 @@ async def request_with_retry(
                         key_item["last_error"] = f"OK ({model_name or 'API'} via {used_ch})"
                         return Response(content=resp.content, status_code=200, media_type="application/json")
                     else:
-                        last_status = resp.status_code
-                        last_content = resp.content
+                        err_dec = resp.content.decode("utf-8", "ignore")
+                        if primary_content is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_dec:
+                            primary_status = resp.status_code
+                            primary_content = resp.content
                         if resp.status_code in (402, 403, 401, 404):
                             continue
                 except Exception as e:
-                    last_content = json.dumps({"error": str(e)}).encode("utf-8")
+                    if primary_content is None:
+                        primary_content = json.dumps({"error": str(e)}).encode("utf-8")
                     continue
+            if primary_status:
+                last_status = primary_status
+            if primary_content:
+                last_content = primary_content
             key_item["fail"] = key_item.get("fail", 0) + 1
             key_item["last_error"] = f"[{model_name}] HTTP {last_status}: {last_content.decode('utf-8', 'ignore')[:100]}"
     return Response(content=last_content, status_code=last_status, media_type="application/json")
@@ -1165,6 +1194,7 @@ async def stream_with_retry(
     for key_item in candidates:
         k = key_item["key"]
         key_item["last_used"] = time.strftime("%H:%M:%S")
+        primary_err_bytes = None
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 targets = await build_targets_for_key(
@@ -1187,14 +1217,20 @@ async def stream_with_retry(
                                 return
                             else:
                                 err_body = await resp.aread()
-                                last_err_bytes = err_body
+                                err_dec = err_body.decode("utf-8", "ignore")
+                                if primary_err_bytes is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_dec:
+                                    primary_err_bytes = err_body
                                 if resp.status_code in (402, 403, 401, 404):
                                     continue
                     except Exception as e:
-                        last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
+                        if primary_err_bytes is None:
+                            primary_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
                         continue
         except Exception as e:
-            last_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
+            if primary_err_bytes is None:
+                primary_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
+        if primary_err_bytes:
+            last_err_bytes = primary_err_bytes
         key_item["fail"] = key_item.get("fail", 0) + 1
         key_item["last_error"] = f"[{model_name}] {last_err_bytes.decode('utf-8', 'ignore')[:100]}"
     yield last_err_bytes
