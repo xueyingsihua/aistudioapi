@@ -857,6 +857,15 @@ async def openai_chat_completions(request: Request):
         )
 
 
+def detect_channel_label(url: str) -> str:
+    if "aiplatform.googleapis.com" in url:
+        m = re.search(r"/locations/([^/]+)/", url)
+        if m:
+            return f"Vertex-{m.group(1)}"
+        return "Vertex"
+    return "AIStudio"
+
+
 async def build_targets_for_key(
     k: str,
     key_item: Dict[str, Any],
@@ -867,7 +876,7 @@ async def build_targets_for_key(
     raw_path: str,
     client: httpx.AsyncClient
 ) -> List[Tuple[str, Dict[str, str]]]:
-    """根据 Key 类型与用户指定的调用通道 (vertex 赠金通道 vs aistudio 普通通道) 构建请求目标"""
+    """根据 Key 类型与用户指定的调用通道构建请求目标（Vertex 支持 global / us-central1 / us-east5 / europe-west4 多区域算力池自动切换）"""
     ch = key_item.get("channel", "")
     if not ch:
         ch = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
@@ -887,18 +896,30 @@ async def build_targets_for_key(
                 ai_list_url += f"?{query_str}"
             return [(ai_list_url, ai_headers)]
 
-        vx_v1_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
-        vx_beta_url = f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:{action}"
+        # 多区域算力池自动轮换：global 挤爆报 429 时自动切 us-central1 / us-east5 / europe-west4 / us-west1
+        vx_regions = [
+            ("global", "https://aiplatform.googleapis.com/v1beta1"),
+            ("global", "https://aiplatform.googleapis.com/v1"),
+            ("us-central1", "https://us-central1-aiplatform.googleapis.com/v1beta1"),
+            ("us-east5", "https://us-east5-aiplatform.googleapis.com/v1beta1"),
+            ("europe-west4", "https://europe-west4-aiplatform.googleapis.com/v1beta1"),
+            ("us-west1", "https://us-west1-aiplatform.googleapis.com/v1beta1"),
+        ]
+        vx_targets = []
+        for loc, base_u in vx_regions:
+            u = f"{base_u}/projects/{project_id}/locations/{loc}/publishers/google/models/{model_name}:{action}"
+            if query_str:
+                u += f"?{query_str}"
+            vx_targets.append((u, vx_headers))
+
         ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/models/{model_name}:{action}"
         if query_str:
-            vx_v1_url += f"?{query_str}"
-            vx_beta_url += f"?{query_str}"
             ai_url += f"?{query_str}"
 
         if prefer_vertex:
-            return [(vx_beta_url, vx_headers), (vx_v1_url, vx_headers), (ai_url, ai_headers)]
+            return vx_targets + [(ai_url, ai_headers)]
         else:
-            return [(ai_url, ai_headers), (vx_beta_url, vx_headers), (vx_v1_url, vx_headers)]
+            return [(ai_url, ai_headers)] + vx_targets
 
     headers = {"Content-Type": "application/json"}
     ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{raw_path}?key={k}"
@@ -944,16 +965,16 @@ async def openai_nonstream_via_native_retry(
                     resp = await client.post(url, headers=hdrs, content=gemini_body)
                     if resp.status_code == 200:
                         key_item["success"] = key_item.get("success", 0) + 1
-                        used_ch = "Vertex" if "aiplatform.googleapis.com" in url else "AIStudio"
+                        used_ch = detect_channel_label(url)
                         key_item["last_error"] = f"OK ({model_name} via {used_ch})"
                         openai_resp = gemini_resp_to_openai(resp.json(), model_name)
                         return JSONResponse(content=openai_resp, status_code=200)
                     else:
                         err_t = resp.text
-                        if primary_err_text is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_t:
+                        if primary_err_text is None or ("ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_t and resp.status_code == 429):
                             primary_status = resp.status_code
                             primary_err_text = err_t
-                        if resp.status_code in (402, 403, 401, 404):
+                        if resp.status_code in (429, 402, 403, 401, 404, 500, 503):
                             continue
                 except Exception as e:
                     if primary_err_text is None:
@@ -992,7 +1013,7 @@ async def openai_stream_via_native_retry(
                         async with client.stream("POST", url, headers=hdrs, content=gemini_body) as resp:
                             if resp.status_code == 200:
                                 key_item["success"] = key_item.get("success", 0) + 1
-                                used_ch = "Vertex" if "aiplatform.googleapis.com" in url else "AIStudio"
+                                used_ch = detect_channel_label(url)
                                 key_item["last_error"] = f"OK ({model_name} via {used_ch})"
                                 async for line in resp.aiter_lines():
                                     if not line or not line.startswith("data:"):
@@ -1033,9 +1054,9 @@ async def openai_stream_via_native_retry(
                             else:
                                 err_body = await resp.aread()
                                 err_str = err_body.decode("utf-8", "ignore")
-                                if primary_err is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_str:
+                                if primary_err is None or ("ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_str and resp.status_code == 429):
                                     primary_err = err_str
-                                if resp.status_code in (402, 403, 401, 404):
+                                if resp.status_code in (429, 402, 403, 401, 404, 500, 503):
                                     continue
                     except Exception as e:
                         if primary_err is None:
@@ -1157,15 +1178,15 @@ async def request_with_retry(
                     )
                     if resp.status_code == 200:
                         key_item["success"] = key_item.get("success", 0) + 1
-                        used_ch = "Vertex" if "aiplatform.googleapis.com" in target_url else "AIStudio"
+                        used_ch = detect_channel_label(target_url)
                         key_item["last_error"] = f"OK ({model_name or 'API'} via {used_ch})"
                         return Response(content=resp.content, status_code=200, media_type="application/json")
                     else:
                         err_dec = resp.content.decode("utf-8", "ignore")
-                        if primary_content is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_dec:
+                        if primary_content is None or ("ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_dec and resp.status_code == 429):
                             primary_status = resp.status_code
                             primary_content = resp.content
-                        if resp.status_code in (402, 403, 401, 404):
+                        if resp.status_code in (429, 402, 403, 401, 404, 500, 503):
                             continue
                 except Exception as e:
                     if primary_content is None:
@@ -1210,7 +1231,7 @@ async def stream_with_retry(
                         ) as resp:
                             if resp.status_code == 200:
                                 key_item["success"] = key_item.get("success", 0) + 1
-                                used_ch = "Vertex" if "aiplatform.googleapis.com" in target_url else "AIStudio"
+                                used_ch = detect_channel_label(target_url)
                                 key_item["last_error"] = f"OK ({model_name or 'stream'} via {used_ch})"
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
@@ -1218,9 +1239,9 @@ async def stream_with_retry(
                             else:
                                 err_body = await resp.aread()
                                 err_dec = err_body.decode("utf-8", "ignore")
-                                if primary_err_bytes is None or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_dec:
+                                if primary_err_bytes is None or ("ACCESS_TOKEN_SCOPE_INSUFFICIENT" not in err_dec and resp.status_code == 429):
                                     primary_err_bytes = err_body
-                                if resp.status_code in (402, 403, 401, 404):
+                                if resp.status_code in (429, 402, 403, 401, 404, 500, 503):
                                     continue
                     except Exception as e:
                         if primary_err_bytes is None:
