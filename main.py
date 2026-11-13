@@ -85,6 +85,17 @@ class KeyPool:
         self._load_env_keys(os.getenv("FREE_API_KEYS", ""), default_tier="free")
         self.save()
 
+    @staticmethod
+    def _infer_initial_balance(note: str, tier: str, channel: str) -> Optional[float]:
+        if tier != "pro" and channel != "vertex":
+            return None
+        if not note:
+            return None
+        m = re.search(r"(300|40)(?:\s*(?:刀|美元|赠金|usd|\$))?", note, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+        return None
+
     def _load_env_keys(self, raw_env: str, default_tier: str):
         if not raw_env:
             return
@@ -94,6 +105,8 @@ class KeyPool:
                 continue
             tier = default_tier
             channel = ""
+            bal_val: Optional[float] = None
+            spent_val: float = 0.0
             note_parts = []
             if "#" in line:
                 parts = line.split("#")
@@ -105,6 +118,16 @@ class KeyPool:
                         tier = low
                     elif low in ("vertex", "aistudio", "gcli"):
                         channel = "vertex" if low in ("vertex", "gcli") else "aistudio"
+                    elif low.startswith("bal="):
+                        try:
+                            bal_val = float(low[4:])
+                        except Exception:
+                            pass
+                    elif low.startswith("spent="):
+                        try:
+                            spent_val = float(low[6:])
+                        except Exception:
+                            pass
                     elif tag:
                         note_parts.append(tag)
                 note = "#".join(note_parts)
@@ -113,6 +136,8 @@ class KeyPool:
                 note = ""
             if not channel:
                 channel = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
+            if bal_val is None:
+                bal_val = self._infer_initial_balance(note, tier, channel)
             if k and not any(item["key"] == k for item in self.keys):
                 self.keys.append({
                     "key": k,
@@ -123,7 +148,11 @@ class KeyPool:
                     "success": 0,
                     "fail": 0,
                     "last_error": "",
-                    "last_used": "-"
+                    "last_used": "-",
+                    "balance_usd": bal_val,
+                    "spent_usd": spent_val,
+                    "last_cost_usd": 0.0,
+                    "last_tokens": ""
                 })
 
     def save(self):
@@ -147,6 +176,8 @@ class KeyPool:
                 continue
             item_tier = tier
             item_channel = ""
+            bal_val: Optional[float] = None
+            spent_val: float = 0.0
             note_parts = []
             if "#" in line:
                 parts = line.split("#")
@@ -158,6 +189,16 @@ class KeyPool:
                         item_tier = low
                     elif low in ("vertex", "aistudio", "gcli"):
                         item_channel = "vertex" if low in ("vertex", "gcli") else "aistudio"
+                    elif low.startswith("bal="):
+                        try:
+                            bal_val = float(low[4:])
+                        except Exception:
+                            pass
+                    elif low.startswith("spent="):
+                        try:
+                            spent_val = float(low[6:])
+                        except Exception:
+                            pass
                     elif tag:
                         note_parts.append(tag)
                 item_note = "#".join(note_parts) or note
@@ -166,6 +207,8 @@ class KeyPool:
                 item_note = note
             if not item_channel:
                 item_channel = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
+            if bal_val is None:
+                bal_val = self._infer_initial_balance(item_note, item_tier, item_channel)
             if k and not any(item["key"] == k for item in self.keys):
                 self.keys.append({
                     "key": k,
@@ -176,7 +219,11 @@ class KeyPool:
                     "success": 0,
                     "fail": 0,
                     "last_error": "",
-                    "last_used": "-"
+                    "last_used": "-",
+                    "balance_usd": bal_val,
+                    "spent_usd": spent_val,
+                    "last_cost_usd": 0.0,
+                    "last_tokens": ""
                 })
                 added += 1
         self.save()
@@ -322,6 +369,9 @@ async def admin_status():
     masked_keys = []
     pro_env_list = []
     free_env_list = []
+    total_spent_usd = 0.0
+    total_remain_usd = 0.0
+    has_any_balance = False
     for idx, item in enumerate(pool.keys):
         k = item["key"]
         note = item.get("note", "")
@@ -331,7 +381,31 @@ async def admin_status():
             raw_ch = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
         channel = "vertex" if raw_ch in ("vertex", "gcli") else "aistudio"
 
-        export_item = f"{k}#{channel}#{note}" if note else f"{k}#{channel}"
+        spent_usd = round(float(item.get("spent_usd") or 0.0), 4)
+        last_cost_usd = round(float(item.get("last_cost_usd") or 0.0), 4)
+        bal_usd = item.get("balance_usd")
+        if bal_usd is None:
+            inferred = pool._infer_initial_balance(note, tier, channel)
+            if inferred is not None:
+                bal_usd = round(max(0.0, inferred - spent_usd), 4)
+                item["balance_usd"] = bal_usd
+        else:
+            bal_usd = round(float(bal_usd), 4)
+
+        total_spent_usd += spent_usd
+        if bal_usd is not None:
+            has_any_balance = True
+            total_remain_usd += bal_usd
+
+        parts_export = [k, channel]
+        if bal_usd is not None:
+            parts_export.append(f"bal={bal_usd:.4f}")
+        if spent_usd > 0:
+            parts_export.append(f"spent={spent_usd:.4f}")
+        if note:
+            parts_export.append(note)
+        export_item = "#".join(parts_export)
+
         if tier == "pro":
             pro_env_list.append(export_item)
         else:
@@ -349,13 +423,19 @@ async def admin_status():
             "success": item.get("success", 0),
             "fail": item.get("fail", 0),
             "last_error": item.get("last_error", ""),
-            "last_used": item.get("last_used", "-")
+            "last_used": item.get("last_used", "-"),
+            "balance_usd": bal_usd,
+            "spent_usd": spent_usd,
+            "last_cost_usd": last_cost_usd,
+            "last_tokens": item.get("last_tokens", "")
         })
     return {
         "keys": masked_keys,
         "pro_env_export": ",".join(pro_env_list),
         "free_env_export": ",".join(free_env_list),
         "total_requests": pool.total_requests,
+        "total_spent_usd": round(total_spent_usd, 4),
+        "total_remain_usd": round(total_remain_usd, 2) if has_any_balance else None,
         "keep_alive_url": pool.keep_alive_url,
         "last_ping_time": pool.last_ping_time,
         "last_ping_status": pool.last_ping_status
@@ -410,6 +490,24 @@ async def admin_update_note(data: Dict[str, Any]):
     idx = data.get("index", -1)
     if 0 <= idx < len(pool.keys):
         pool.keys[idx]["note"] = str(data.get("note", "")).strip()
+        pool.save()
+    return {"ok": True}
+
+
+@app.post("/api/admin/keys/balance", dependencies=[Depends(verify_admin)])
+async def admin_update_balance(data: Dict[str, Any]):
+    idx = data.get("index", -1)
+    raw_bal = str(data.get("balance", "")).strip()
+    if 0 <= idx < len(pool.keys):
+        if raw_bal == "" or raw_bal.lower() == "null":
+            pool.keys[idx]["balance_usd"] = None
+        else:
+            try:
+                pool.keys[idx]["balance_usd"] = round(float(raw_bal.replace("$", "").replace("刀", "").strip()), 4)
+            except Exception:
+                raise HTTPException(status_code=400, detail="请输入有效的数字金额（例如 40 或 38.5）")
+        if data.get("reset_spent"):
+            pool.keys[idx]["spent_usd"] = 0.0
         pool.save()
     return {"ok": True}
 
@@ -866,6 +964,86 @@ def detect_channel_label(url: str) -> str:
     return "AIStudio"
 
 
+def record_usage_and_cost(key_item: Dict[str, Any], model_name: str, used_ch: str, usage: Optional[Dict[str, Any]]):
+    """根据 Google 返回的 usageMetadata 自动计算本条花费并扣减该账号的赠金账本"""
+    if not usage or not isinstance(usage, dict):
+        return
+    in_tok = int(usage.get("promptTokenCount") or 0)
+    cached_tok = int(usage.get("cachedContentTokenCount") or 0)
+    out_tok = int(usage.get("candidatesTokenCount") or 0)
+    think_tok = int(usage.get("thoughtsTokenCount") or 0)
+    total_out = out_tok + think_tok
+    if in_tok == 0 and total_out == 0:
+        return
+
+    billable_in = max(0, in_tok - cached_tok)
+    m_low = (model_name or "").lower()
+
+    if used_ch == "AIStudio":
+        # 普通 AI Studio 通道走的是免费额度，不消耗 GCP 赠金
+        cost_usd = 0.0
+    else:
+        # Vertex 赠金通道按 Google 官方单价计算 (美元 / 百万 Tokens)
+        if "lite" in m_low:
+            in_rate, out_rate = 0.075, 0.30
+        elif "flash" in m_low:
+            in_rate = 0.15
+            out_rate = 0.60
+        else:
+            # Pro / Ultra / Gemini-4 (Argon / Carbon 等高级模型)
+            if in_tok <= 200000:
+                in_rate, out_rate = 1.25, 10.00
+            else:
+                in_rate, out_rate = 2.50, 15.00
+        cost_usd = (billable_in * in_rate + cached_tok * (in_rate * 0.25) + total_out * out_rate) / 1_000_000.0
+
+    key_item["last_cost_usd"] = round(cost_usd, 6)
+    key_item["last_tokens"] = f"入{in_tok}/出{total_out}"
+    old_spent = float(key_item.get("spent_usd") or 0.0)
+    new_spent = round(old_spent + cost_usd, 6)
+    key_item["spent_usd"] = new_spent
+
+    cur_bal = key_item.get("balance_usd")
+    if cur_bal is None:
+        inferred = pool._infer_initial_balance(
+            key_item.get("note", ""), key_item.get("tier", "pro"), key_item.get("channel", "vertex")
+        )
+        if inferred is not None:
+            key_item["balance_usd"] = round(max(0.0, inferred - new_spent), 4)
+    else:
+        key_item["balance_usd"] = round(max(0.0, float(cur_bal) - cost_usd), 4)
+
+    if cost_usd > 0:
+        cny = cost_usd * 7.25
+        key_item["last_error"] = f"OK ({model_name} via {used_ch}) | 本条 ${cost_usd:.4f} (≈¥{cny:.2f}) [入{in_tok}/出{total_out}]"
+    else:
+        key_item["last_error"] = f"OK ({model_name} via {used_ch}) | 本条 $0.00 (免费额度) [入{in_tok}/出{total_out}]"
+    pool.save()
+
+
+def extract_usage_from_stream_tail(tail_text: str) -> Optional[Dict[str, Any]]:
+    """从原生流式响应末尾提取 usageMetadata"""
+    if not tail_text or "usageMetadata" not in tail_text:
+        return None
+    try:
+        matches = list(re.finditer(r'"usageMetadata"\s*:\s*\{', tail_text))
+        if not matches:
+            return None
+        start_idx = matches[-1].end() - 1
+        depth = 0
+        for i in range(start_idx, len(tail_text)):
+            ch = tail_text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(tail_text[start_idx:i + 1])
+    except Exception:
+        pass
+    return None
+
+
 async def build_targets_for_key(
     k: str,
     key_item: Dict[str, Any],
@@ -967,7 +1145,9 @@ async def openai_nonstream_via_native_retry(
                         key_item["success"] = key_item.get("success", 0) + 1
                         used_ch = detect_channel_label(url)
                         key_item["last_error"] = f"OK ({model_name} via {used_ch})"
-                        openai_resp = gemini_resp_to_openai(resp.json(), model_name)
+                        g_json = resp.json()
+                        record_usage_and_cost(key_item, model_name, used_ch, g_json.get("usageMetadata"))
+                        openai_resp = gemini_resp_to_openai(g_json, model_name)
                         return JSONResponse(content=openai_resp, status_code=200)
                     else:
                         err_t = resp.text
@@ -1015,6 +1195,7 @@ async def openai_stream_via_native_retry(
                                 key_item["success"] = key_item.get("success", 0) + 1
                                 used_ch = detect_channel_label(url)
                                 key_item["last_error"] = f"OK ({model_name} via {used_ch})"
+                                last_usage = None
                                 async for line in resp.aiter_lines():
                                     if not line or not line.startswith("data:"):
                                         continue
@@ -1023,6 +1204,8 @@ async def openai_stream_via_native_retry(
                                         continue
                                     try:
                                         g_chunk = json.loads(data_str)
+                                        if "usageMetadata" in g_chunk:
+                                            last_usage = g_chunk["usageMetadata"]
                                         cands = g_chunk.get("candidates", [])
                                         if cands:
                                             parts = cands[0].get("content", {}).get("parts", [])
@@ -1042,6 +1225,8 @@ async def openai_stream_via_native_retry(
                                                 yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
                                     except Exception:
                                         continue
+                                if last_usage:
+                                    record_usage_and_cost(key_item, model_name, used_ch, last_usage)
                                 done_chunk = {
                                     "id": chat_id,
                                     "object": "chat.completion.chunk",
@@ -1180,6 +1365,12 @@ async def request_with_retry(
                         key_item["success"] = key_item.get("success", 0) + 1
                         used_ch = detect_channel_label(target_url)
                         key_item["last_error"] = f"OK ({model_name or 'API'} via {used_ch})"
+                        if model_name and method == "POST":
+                            try:
+                                g_json = resp.json()
+                                record_usage_and_cost(key_item, model_name, used_ch, g_json.get("usageMetadata"))
+                            except Exception:
+                                pass
                         return Response(content=resp.content, status_code=200, media_type="application/json")
                     else:
                         err_dec = resp.content.decode("utf-8", "ignore")
@@ -1233,8 +1424,17 @@ async def stream_with_retry(
                                 key_item["success"] = key_item.get("success", 0) + 1
                                 used_ch = detect_channel_label(target_url)
                                 key_item["last_error"] = f"OK ({model_name or 'stream'} via {used_ch})"
+                                tail_buf = ""
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
+                                    try:
+                                        tail_buf = (tail_buf + chunk.decode("utf-8", "ignore"))[-6000:]
+                                    except Exception:
+                                        pass
+                                if model_name:
+                                    usage = extract_usage_from_stream_tail(tail_buf)
+                                    if usage:
+                                        record_usage_and_cost(key_item, model_name, used_ch, usage)
                                 return
                             else:
                                 err_body = await resp.aread()
@@ -1562,8 +1762,8 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="grid">
       <div class="stat"><div>💎 赠金/Pro池 (可用Pro)</div><div class="stat-val" style="color:#fbbf24" id="statPro">0</div></div>
       <div class="stat"><div>⚡ 免费/Flash池 (仅Flash)</div><div class="stat-val" style="color:#38bdf8" id="statFree">0</div></div>
-      <div class="stat"><div>📊 累计转发请求数</div><div class="stat-val" id="statReqs">0</div></div>
-      <div class="stat"><div>💓 Render 保活状态</div><div class="stat-val" style="font-size:14px;" id="statPing">-</div></div>
+      <div class="stat"><div>💰 剩余赠金 / 累计账单</div><div class="stat-val" style="color:#34d399;font-size:16px;" id="statCost">$0.00</div></div>
+      <div class="stat"><div>📊 累计请求 / 保活</div><div class="stat-val" style="font-size:15px;" id="statReqs">0</div><div style="font-size:12px;color:#94a3b8;margin-top:2px;" id="statPing">-</div></div>
     </div>
 
     <div class="card">
@@ -1639,7 +1839,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>序号</th><th>API Key</th><th>层级分组 (点击切换)</th><th>调用通道 (点击切换)</th><th>备注</th><th>状态</th><th>成功/失败</th><th>最近状态 / 报错</th><th>操作</th></tr>
+            <tr><th>序号</th><th>API Key</th><th>层级分组 (点击切换)</th><th>调用通道 (点击切换)</th><th>💰 赠金余额 / 单条账单 (点击校准)</th><th>备注</th><th>状态</th><th>成功/失败</th><th>最近状态 / 报错</th><th>操作</th></tr>
           </thead>
           <tbody id="keyTable"></tbody>
         </table>
@@ -1767,8 +1967,14 @@ function renderData(data) {
   const activeFree = data.keys.filter(k => k.enabled && k.tier === "free").length;
   document.getElementById("statPro").innerText = activePro + " 个启用";
   document.getElementById("statFree").innerText = activeFree + " 个启用";
-  document.getElementById("statReqs").innerText = data.total_requests;
-  document.getElementById("statPing").innerText = data.keep_alive_url ? data.last_ping_status : "未开启 (留空)";
+  document.getElementById("statReqs").innerText = "请求 " + data.total_requests + " 次";
+  document.getElementById("statPing").innerText = "保活: " + (data.keep_alive_url ? data.last_ping_status : "未开启");
+  const spent = Number(data.total_spent_usd || 0);
+  if (data.total_remain_usd !== null && data.total_remain_usd !== undefined) {
+    document.getElementById("statCost").innerHTML = `剩 $${Number(data.total_remain_usd).toFixed(2)} <span style="font-size:12px;color:#94a3b8;font-weight:normal;">(已花 $${spent.toFixed(4)})</span>`;
+  } else {
+    document.getElementById("statCost").innerHTML = `已花 $${spent.toFixed(4)} <span style="font-size:12px;color:#94a3b8;font-weight:normal;">(≈¥${(spent*7.25).toFixed(2)})</span>`;
+  }
   document.getElementById("pingTime").innerText = data.last_ping_time;
   document.getElementById("keepAliveInput").value = data.keep_alive_url || "";
   document.getElementById("exportProVal").value = data.pro_env_export || "";
@@ -1785,12 +1991,32 @@ function renderData(data) {
     const chBadge = isVx
       ? `<span class="badge vx" title="当前走 Vertex 抵扣 GCP 赠金，点击可切换为普通 AIStudio 免费通道" onclick="switchChannel(${item.index})">🏛️ Vertex赠金通道</span>`
       : `<span class="badge ai" title="当前走普通 AIStudio 通道（不扣Vertex赠金），点击可切换为 Vertex 赠金通道" onclick="switchChannel(${item.index})">🌱 普通AIStudio通道</span>`;
+
+    const lastCost = Number(item.last_cost_usd || 0);
+    const itemSpent = Number(item.spent_usd || 0);
+    const hasBal = item.balance_usd !== null && item.balance_usd !== undefined;
+    let balTop = "";
+    if (hasBal) {
+      const b = Number(item.balance_usd);
+      balTop = `<span style="color:#34d399;font-weight:700;">剩余 $${b.toFixed(4)}</span> <span style="color:#94a3b8;font-size:11px;">(≈¥${(b*7.25).toFixed(1)})</span>`;
+    } else if (isVx) {
+      balTop = `<span style="color:#fbbf24;border-bottom:1px dashed #fbbf24;">✏️ 点击输入初始赠金(如40)</span>`;
+    } else {
+      balTop = `<span style="color:#38bdf8;">🌱 免费白嫖通道 ($0)</span>`;
+    }
+    const costSub = (lastCost > 0 || itemSpent > 0)
+      ? `<div style="font-size:11px;color:#cbd5e1;margin-top:3px;">本条: <b style="color:#fbbf24">$${lastCost.toFixed(4)}</b> (≈¥${(lastCost*7.25).toFixed(2)}) | 累计: $${itemSpent.toFixed(4)}</div>`
+      : `<div style="font-size:11px;color:#64748b;margin-top:2px;">发消息后自动统计每条花费</div>`;
+
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td data-label="序号">#${item.index + 1}</td>
       <td data-label="密钥"><code>${item.masked_key}</code></td>
       <td data-label="层级分组 (点击切换)">${tierBadge}</td>
       <td data-label="调用通道 (点击切换)">${chBadge}</td>
+      <td data-label="💰 赠金余额 / 账单" style="cursor:pointer;" title="点击校准/设置该账号的当前剩余赠金美元数" onclick="editBalance(${item.index}, '${hasBal ? item.balance_usd : ''}')">
+        <div>${balTop}${costSub}</div>
+      </td>
       <td data-label="备注" style="color:#94a3b8;font-size:13px;cursor:pointer;" title="点击修改备注" onclick="editNote(${item.index}, '${(item.note || '').replace(/'/g, "\\'")}')">
         <span style="border-bottom:1px dashed #64748b;padding-bottom:2px;">${item.note || '✏️ 点击加备注'}</span>
       </td>
@@ -1856,6 +2082,20 @@ async function editNote(index, oldNote) {
     method: "POST", headers: {"Content-Type": "application/json", "x-admin-password": pwd},
     body: JSON.stringify({index, note: newNote.trim()})
   });
+  loadStatus();
+}
+
+async function editBalance(index, oldBal) {
+  const val = prompt("💰 请输入该账号当前的【剩余赠金美元数】（例如 40 或 36.8，输入后每发一条消息都会按官方 Token 单价自动实时扣减；清空确定则取消余额追踪）：", oldBal || "40");
+  if (val === null) return;
+  const r = await fetch("/api/admin/keys/balance", {
+    method: "POST", headers: {"Content-Type": "application/json", "x-admin-password": pwd},
+    body: JSON.stringify({index, balance: val.trim()})
+  });
+  if (!r.ok) {
+    const err = await r.json();
+    alert(err.detail || "设置失败");
+  }
   loadStatus();
 }
 

@@ -11,7 +11,7 @@
 1. **🌐 网页一键 Google 授权登录（免开黑框 / 全自动查项目 ID）**
    - 直接在管理面板点击按钮登录 Google 账号、粘贴授权码，后台**全自动扫描账号下的 GCP 项目、自动开启 Vertex AI 与 Gemini API 服务并生成永久刷新凭证 (`GCLI:`)**，彻底告别繁琐的命令行和手填项目 ID！
 2. **🏛️ Vertex 赠金通道 / 🌱 普通免费通道 随心一键切换**
-   - **Vertex 赠金通道**：绕过 AI Studio 预充值限制，直接消耗 Google Cloud 里的 **$40 / $300 试用赠金**，满血畅玩 `gemini-3.1-pro-preview`、`gemini-2.5-pro`、`gemini-3.8-flash` 等全系列模型！
+   - **Vertex 赠金通道**：绕过 AI Studio 预充值限制，直接消耗 Google Cloud 里的 **$300 试用赠金**，满血畅玩 `gemini-3.1-pro-preview`、`gemini-2.5-pro`、`gemini-3.8-flash` 等全系列模型！
    - **普通 AI Studio 通道**：支持纯免费层级小号（或有赠金但不想扣赠金时），一键切回普通通道白嫖免费 Flash 额度。
 3. **💎 赠金/Pro 池 & ⚡ 免费/Flash 池 智能分池调度**
 <<<<<<< HEAD
