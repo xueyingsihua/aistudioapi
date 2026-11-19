@@ -865,11 +865,20 @@ def gemini_resp_to_openai(gemini_data: Dict[str, Any], model_name: str) -> Dict[
 DEFAULT_FULL_MODELS = [
     ("gemini-4-argon", "Gemini 4 Argon (Preview)"),
     ("gemini-4-carbon", "Gemini 4 Carbon (Preview)"),
+    ("gemini-4-hydrogen", "Gemini 4 Hydrogen (Preview)"),
+    ("gemini-4-neon", "Gemini 4 Neon (Preview)"),
     ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
+    ("gemini-3.1-pro-preview-customtools", "Gemini 3.1 Pro Preview CustomTools"),
     ("gemini-3.1-pro", "Gemini 3.1 Pro"),
     ("gemini-2.5-pro", "Gemini 2.5 Pro"),
     ("gemini-3.8-flash", "Gemini 3.8 Flash"),
     ("gemini-3.8-flash-preview", "Gemini 3.8 Flash Preview"),
+    ("gemini-3.7-flash", "Gemini 3.7 Flash"),
+    ("gemini-3.6-flash", "Gemini 3.6 Flash"),
+    ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+    ("gemini-3.5-flash-lite", "Gemini 3.5 Flash Lite"),
+    ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
+    ("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite Preview"),
     ("gemini-3-flash-preview", "Gemini 3.0 Flash Preview"),
     ("gemini-2.5-flash", "Gemini 2.5 Flash"),
     ("gemini-flash-latest", "Gemini Flash Latest"),
@@ -878,42 +887,89 @@ DEFAULT_FULL_MODELS = [
 ]
 
 
+async def fetch_merged_gemini_models() -> List[Dict[str, Any]]:
+    """拉取 Google 官方完整在线模型列表，并与保底推荐列表合并（纯 GCLI: 凭证池也能拉出全部 50+ 个模型）"""
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _add_model_entry(m_obj: Dict[str, Any]):
+        raw_name = m_obj.get("name", "")
+        short_id = raw_name.replace("models/", "").strip()
+        if not short_id or short_id in seen:
+            return
+        seen.add(short_id)
+        entry = dict(m_obj)
+        entry["name"] = f"models/{short_id}"
+        methods = list(entry.get("supportedGenerationMethods") or [])
+        if "generateContent" not in methods:
+            methods.append("generateContent")
+        if "streamGenerateContent" not in methods:
+            methods.append("streamGenerateContent")
+        entry["supportedGenerationMethods"] = methods
+        merged.append(entry)
+
+    active_keys = [k for k in pool.keys if k.get("enabled", True)]
+    ordered_keys = (
+        [k for k in active_keys if not k["key"].startswith("GCLI:")]
+        + [k for k in active_keys if k["key"].startswith("GCLI:")]
+    )
+
+    live_models: List[Dict[str, Any]] = []
+    if ordered_keys:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for key_item in ordered_keys[:4]:
+                k = key_item["key"]
+                try:
+                    if k.startswith("GCLI:"):
+                        access_token, project_id = await resolve_gcli_token(k, client)
+                        hdrs = {"Authorization": f"Bearer {access_token}"}
+                        if project_id:
+                            hdrs["x-goog-user-project"] = project_id
+                        r2 = await client.get(
+                            f"{GOOGLE_BASE_URL}/v1beta/models",
+                            params={"pageSize": 200},
+                            headers=hdrs
+                        )
+                    else:
+                        r2 = await client.get(
+                            f"{GOOGLE_BASE_URL}/v1beta/models",
+                            params={"key": k, "pageSize": 200}
+                        )
+                    if r2.status_code == 200:
+                        live_models = r2.json().get("models", [])
+                        if live_models:
+                            break
+                except Exception:
+                    continue
+
+    for m_id, m_title in DEFAULT_FULL_MODELS:
+        _add_model_entry({
+            "name": f"models/{m_id}",
+            "displayName": m_title,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+        })
+
+    for m in live_models:
+        _add_model_entry(m)
+
+    return merged
+
+
 @app.get("/v1/models")
 async def openai_list_models(request: Request):
     check_client_auth(request)
-    default_models = [m[0] for m in DEFAULT_FULL_MODELS]
-    candidates = pool.get_candidates_for_model("flash")
-    if not candidates:
-        return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "google"} for m in default_models]}
-
-    key_item = candidates[0]
-    k = key_item["key"]
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            if k.startswith("GCLI:"):
-                access_token, project_id = await resolve_gcli_token(k, client)
-                r2 = await client.get(
-                    f"{GOOGLE_BASE_URL}/v1beta/models",
-                    headers={"Authorization": f"Bearer {access_token}", "x-goog-user-project": project_id}
-                )
-            else:
-                r2 = await client.get(f"{GOOGLE_BASE_URL}/v1beta/models", params={"key": k})
-            if r2.status_code == 200:
-                models_data = r2.json().get("models", [])
-                out = []
-                seen = set()
-                for dm in default_models:
-                    seen.add(dm)
-                    out.append({"id": dm, "object": "model", "owned_by": "google"})
-                for m in models_data:
-                    name = m.get("name", "").replace("models/", "")
-                    if name and name not in seen:
-                        seen.add(name)
-                        out.append({"id": name, "object": "model", "owned_by": "google"})
-                return {"object": "list", "data": out}
-        except Exception:
-            pass
-        return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "google"} for m in default_models]}
+    models_list = await fetch_merged_gemini_models()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": m["name"].replace("models/", ""),
+                "object": "model",
+                "owned_by": "google"
+            }
+            for m in models_list
+        ]
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -1269,18 +1325,7 @@ async def google_native_proxy(path: str, request: Request):
     action = m_match.group(2) if (m_match and m_match.group(2)) else ""
 
     if path.rstrip("/") == "models" and request.method == "GET":
-        non_gcli = [k for k in pool.keys if k.get("enabled", True) and not k["key"].startswith("GCLI:")]
-        if not non_gcli:
-            return {
-                "models": [
-                    {
-                        "name": f"models/{m_id}",
-                        "displayName": m_title,
-                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
-                    }
-                    for m_id, m_title in DEFAULT_FULL_MODELS
-                ]
-            }
+        return {"models": await fetch_merged_gemini_models()}
 
     candidates = pool.get_candidates_for_model(model_name)
     if not candidates:
