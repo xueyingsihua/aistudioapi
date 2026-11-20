@@ -44,10 +44,10 @@ FLASH_FALLBACK_CHAIN: List[str] = [
     "gemini-flash-latest",
 ]
 
-NONSTREAM_MULTI_TIMEOUT = httpx.Timeout(connect=8.0, read=45.0, write=15.0, pool=8.0)
-NONSTREAM_SINGLE_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=15.0, pool=10.0)
-STREAM_MULTI_TIMEOUT = httpx.Timeout(connect=8.0, read=35.0, write=15.0, pool=8.0)
-STREAM_SINGLE_TIMEOUT = httpx.Timeout(connect=10.0, read=65.0, write=15.0, pool=10.0)
+NONSTREAM_MULTI_TIMEOUT = httpx.Timeout(connect=8.0, read=90.0, write=20.0, pool=8.0)
+NONSTREAM_SINGLE_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=20.0, pool=10.0)
+STREAM_MULTI_TIMEOUT = httpx.Timeout(connect=8.0, read=90.0, write=20.0, pool=8.0)
+STREAM_SINGLE_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=20.0, pool=10.0)
 SHARED_HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=30, keepalive_expiry=60.0)
 
 _gcli_token_cache: Dict[str, Tuple[str, float, str]] = {}
@@ -90,6 +90,8 @@ def should_prefer_error(
 ) -> bool:
     if prev_text is None:
         return True
+    if new_status not in RETRYABLE_PROXY_STATUSES:
+        return True
     if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in new_text:
         return False
     if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in prev_text:
@@ -102,6 +104,8 @@ def should_prefer_error(
 class RegionHealthTracker:
     def __init__(self):
         self.cooldown_until: Dict[Tuple[str, str], float] = {}
+        self.not_found_until: Dict[Tuple[str, str], float] = {}
+        self.cooldown_reason: Dict[Tuple[str, str], str] = {}
         self.last_success: Dict[str, str] = {}
         self.rr_cursor: Dict[str, int] = {}
 
@@ -115,6 +119,12 @@ class RegionHealthTracker:
             return
         m_key = (model_name or "").strip().lower()
         self.cooldown_until.pop((m_key, region_key), None)
+        self.not_found_until.pop((m_key, region_key), None)
+        self.cooldown_reason.pop((m_key, region_key), None)
+        if region_key.startswith("global:"):
+            for alt_g in ("global:v1beta1", "global:v1"):
+                self.cooldown_until.pop((m_key, alt_g), None)
+                self.cooldown_reason.pop((m_key, alt_g), None)
         self.last_success[m_key] = region_key
 
     def mark_failure(
@@ -129,17 +139,45 @@ class RegionHealthTracker:
         m_key = (model_name or "").strip().lower()
         now = time.time()
         if status_code == 404:
-            cd = 600.0
-        elif is_timeout or status_code in (408, 502, 503, 504):
-            cd = 60.0
-        elif status_code in (429, 500):
-            cd = 45.0
+            prev_nf = self.not_found_until.get((m_key, region_key), 0.0)
+            self.not_found_until[(m_key, region_key)] = max(prev_nf, now + 1800.0)
+            self.cooldown_until.pop((m_key, region_key), None)
+            self.cooldown_reason.pop((m_key, region_key), None)
         else:
-            cd = 20.0
-        prev_until = self.cooldown_until.get((m_key, region_key), 0.0)
-        self.cooldown_until[(m_key, region_key)] = max(prev_until, now + cd)
+            if is_timeout or status_code in (408, 502, 503, 504):
+                cd = 45.0
+            elif status_code in (429, 500):
+                cd = 25.0
+            else:
+                cd = 20.0
+            prev_until = self.cooldown_until.get((m_key, region_key), 0.0)
+            new_until = max(prev_until, now + cd)
+            self.cooldown_until[(m_key, region_key)] = new_until
+            self.cooldown_reason[(m_key, region_key)] = "timeout" if is_timeout else str(status_code)
+            if region_key == "global:v1beta1" and status_code in (429, 503):
+                nf_v1 = self.not_found_until.get((m_key, "global:v1"), 0.0)
+                if nf_v1 <= now:
+                    self.cooldown_until[(m_key, "global:v1")] = max(
+                        self.cooldown_until.get((m_key, "global:v1"), 0.0),
+                        new_until + 0.1,
+                    )
+                    self.cooldown_reason[(m_key, "global:v1")] = str(status_code)
         if self.last_success.get(m_key) == region_key:
             self.last_success.pop(m_key, None)
+
+    def has_healthy_non_global(self, model_name: str, regions: List[Tuple[str, str]]) -> bool:
+        m_key = (model_name or "").strip().lower()
+        now = time.time()
+        for loc, base_u in regions:
+            if loc == "global":
+                continue
+            r_key = self.make_region_key(loc, base_u)
+            if self.not_found_until.get((m_key, r_key), 0.0) > now:
+                continue
+            if self.cooldown_until.get((m_key, r_key), 0.0) > now:
+                continue
+            return True
+        return False
 
     def order_regions(
         self,
@@ -152,64 +190,103 @@ class RegionHealthTracker:
         m_key = (model_name or "").strip().lower()
         now = time.time()
         healthy: List[Tuple[str, str]] = []
-        cooling_pairs: List[Tuple[float, Tuple[str, str]]] = []
-        for pair in regions:
+        cooling_pairs: List[Tuple[float, int, Tuple[str, str]]] = []
+        for orig_idx, pair in enumerate(regions):
             r_key = self.make_region_key(pair[0], pair[1])
+            nf_until = self.not_found_until.get((m_key, r_key), 0.0)
+            if nf_until > now:
+                # 404 区域严格跳过，不拼在返回列表末尾
+                continue
+            elif (m_key, r_key) in self.not_found_until:
+                self.not_found_until.pop((m_key, r_key), None)
+
             until = self.cooldown_until.get((m_key, r_key), 0.0)
             if until > now:
-                cooling_pairs.append((until, pair))
+                cooling_pairs.append((until, orig_idx, pair))
             else:
                 if (m_key, r_key) in self.cooldown_until:
                     self.cooldown_until.pop((m_key, r_key), None)
+                    self.cooldown_reason.pop((m_key, r_key), None)
                 healthy.append(pair)
 
-        cooling_pairs.sort(key=lambda x: x[0])
-        cooling = [p for _, p in cooling_pairs]
-        if len(healthy) <= 1:
-            return healthy + cooling
+        if healthy:
+            if len(healthy) == 1:
+                return healthy
+            sticky = self.last_success.get(m_key, "")
+            anchor: Optional[Tuple[str, str]] = None
+            if sticky:
+                for pair in healthy:
+                    if self.make_region_key(pair[0], pair[1]) == sticky:
+                        anchor = pair
+                        break
+            if anchor is None:
+                for pair in healthy:
+                    if self.make_region_key(pair[0], pair[1]) == "global:v1beta1":
+                        anchor = pair
+                        break
+            if anchor is None:
+                for pair in healthy:
+                    if pair[0] == "global":
+                        anchor = pair
+                        break
 
-        sticky = self.last_success.get(m_key, "")
-        sticky_item: Optional[Tuple[str, str]] = None
-        rest: List[Tuple[str, str]] = []
-        for pair in healthy:
-            if sticky and not sticky_item and self.make_region_key(pair[0], pair[1]) == sticky:
-                sticky_item = pair
-            else:
-                rest.append(pair)
+            if anchor is not None:
+                rest = [p for p in healthy if p is not anchor]
+                if rest:
+                    idx = self.rr_cursor.get(m_key, 0) % len(rest)
+                    if advance_cursor:
+                        self.rr_cursor[m_key] = (idx + 1) % len(rest)
+                    rest = rest[idx:] + rest[:idx]
+                return [anchor] + rest
 
-        if sticky_item is not None:
-            if rest:
-                idx = self.rr_cursor.get(m_key, 0) % len(rest)
-                if advance_cursor:
-                    self.rr_cursor[m_key] = (idx + 1) % len(rest)
-                rest = rest[idx:] + rest[:idx]
-            ordered_healthy = [sticky_item] + rest
-        else:
             idx = self.rr_cursor.get(m_key, 0) % len(healthy)
             if advance_cursor:
                 self.rr_cursor[m_key] = (idx + 1) % len(healthy)
-            ordered_healthy = healthy[idx:] + healthy[:idx]
+            return healthy[idx:] + healthy[:idx]
 
-        return ordered_healthy + cooling
+        if cooling_pairs:
+            cooling_pairs.sort(key=lambda x: (x[0], x[1]))
+            return [p for _, _, p in cooling_pairs]
+
+        # 所有区域均处于 404 冷却时，保留 1 个兜底探活区域以免空列表
+        return [regions[0]]
 
     def get_active_cooldowns(self) -> List[Dict[str, Any]]:
         now = time.time()
         active: List[Dict[str, Any]] = []
-        expired: List[Tuple[str, str]] = []
+        expired_cd: List[Tuple[str, str]] = []
+        expired_nf: List[Tuple[str, str]] = []
+
         for (m_key, r_key), until in self.cooldown_until.items():
             remain = int(until - now)
             if remain > 0:
-                active.append({"model": m_key or "*", "region": r_key, "remain_sec": remain})
+                reason = self.cooldown_reason.get((m_key, r_key), "429")
+                active.append({"model": m_key or "*", "region": r_key, "remain_sec": remain, "reason": reason})
             else:
-                expired.append((m_key, r_key))
-        for k in expired:
+                expired_cd.append((m_key, r_key))
+
+        for (m_key, r_key), until in self.not_found_until.items():
+            remain = int(until - now)
+            if remain > 0:
+                active.append({"model": m_key or "*", "region": r_key, "remain_sec": remain, "reason": "404"})
+            else:
+                expired_nf.append((m_key, r_key))
+
+        for k in expired_cd:
             self.cooldown_until.pop(k, None)
+            self.cooldown_reason.pop(k, None)
+        for k in expired_nf:
+            self.not_found_until.pop(k, None)
+
         active.sort(key=lambda x: x["remain_sec"], reverse=True)
         return active
 
     def clear_cooldowns(self):
         self.cooldown_until.clear()
+        self.not_found_until.clear()
+        self.cooldown_reason.clear()
         self.last_success.clear()
+        self.rr_cursor.clear()
 
 
 region_health = RegionHealthTracker()
@@ -1237,13 +1314,10 @@ async def openai_chat_completions(request: Request):
     gemini_body_bytes = json.dumps(gemini_payload, ensure_ascii=False).encode("utf-8")
 
     if is_stream:
-        return StreamingResponse(
-            openai_stream_via_native_retry(
-                model_name=model_name,
-                gemini_body=gemini_body_bytes,
-                candidates=candidates
-            ),
-            media_type="text/event-stream"
+        return await openai_stream_via_native_retry(
+            model_name=model_name,
+            gemini_body=gemini_body_bytes,
+            candidates=candidates
         )
     else:
         return await openai_nonstream_via_native_retry(
@@ -1262,7 +1336,13 @@ def detect_channel_label(url: str) -> str:
     return "AIStudio"
 
 
-def record_usage_and_cost(key_item: Dict[str, Any], model_name: str, used_ch: str, usage: Optional[Dict[str, Any]]):
+def record_usage_and_cost(
+    key_item: Dict[str, Any],
+    model_name: str,
+    used_ch: str,
+    usage: Optional[Dict[str, Any]],
+    display_tag: Optional[str] = None,
+):
     """根据 Google 返回的 usageMetadata 自动计算本条花费并扣减该账号的赠金账本"""
     if not usage or not isinstance(usage, dict):
         return
@@ -1288,7 +1368,7 @@ def record_usage_and_cost(key_item: Dict[str, Any], model_name: str, used_ch: st
             in_rate = 0.15
             out_rate = 0.60
         else:
-            # Pro / Ultra / Gemini-4 (Argon / Carbon 等高级模型)
+            # Pro / Ultra / Gemini-4 (Argon / Carbon / Neon 等高级模型)
             if in_tok <= 200000:
                 in_rate, out_rate = 1.25, 10.00
             else:
@@ -1311,11 +1391,12 @@ def record_usage_and_cost(key_item: Dict[str, Any], model_name: str, used_ch: st
     else:
         key_item["balance_usd"] = round(max(0.0, float(cur_bal) - cost_usd), 4)
 
+    label = display_tag or model_name
     if cost_usd > 0:
         cny = cost_usd * 7.25
-        key_item["last_error"] = f"OK ({model_name} via {used_ch}) | 本条 ${cost_usd:.4f} (≈¥{cny:.2f}) [入{in_tok}/出{total_out}]"
+        key_item["last_error"] = f"OK ({label} via {used_ch}) | 本条 ${cost_usd:.4f} (≈¥{cny:.2f}) [入{in_tok}/出{total_out}]"
     else:
-        key_item["last_error"] = f"OK ({model_name} via {used_ch}) | 本条 $0.00 (免费额度) [入{in_tok}/出{total_out}]"
+        key_item["last_error"] = f"OK ({label} via {used_ch}) | 本条 $0.00 (免费额度) [入{in_tok}/出{total_out}]"
     pool.save()
 
 
@@ -1353,7 +1434,7 @@ async def build_targets_for_key(
     client: httpx.AsyncClient,
     max_vx_regions: Optional[int] = None,
 ) -> List[Tuple[str, Dict[str, str]]]:
-    """根据 Key 类型与健康追踪器构建请求目标（Vertex 11 区域池带健康优先与故障冷却）"""
+    """根据 Key 类型与健康追踪器构建请求目标（Vertex 多区健康优先，跳过已确认 404 地区）"""
     ch = key_item.get("channel", "")
     if not ch:
         ch = "vertex" if (k.startswith("GCLI:") or k.startswith("AQ.")) else "aistudio"
@@ -1384,14 +1465,13 @@ async def build_targets_for_key(
                 u += f"?{query_str}"
             vx_targets.append((u, vx_headers))
 
+        if prefer_vertex:
+            return vx_targets
+
         ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/models/{model_name}:{action}"
         if query_str:
             ai_url += f"?{query_str}"
-
-        if prefer_vertex:
-            return vx_targets + [(ai_url, ai_headers)]
-        else:
-            return [(ai_url, ai_headers)] + vx_targets
+        return [(ai_url, ai_headers)] + vx_targets
 
     headers = {"Content-Type": "application/json"}
     ai_url = f"{GOOGLE_BASE_URL}/{version_prefix}/{raw_path}?key={k}"
@@ -1408,90 +1488,210 @@ async def build_targets_for_key(
     return [(ai_url, headers)]
 
 
-async def openai_nonstream_via_native_retry(
+async def _dispatch_upstream(
+    *,
+    method: str,
     model_name: str,
-    gemini_body: bytes,
-    candidates: List[Dict[str, Any]]
-):
-    last_status = 500
-    last_err_text = "All keys failed"
+    action: str,
+    query_str: str,
+    version_prefix: str,
+    raw_path: str,
+    body: bytes,
+    candidates: List[Dict[str, Any]],
+    stream: bool,
+) -> Tuple[Optional[httpx.Response], Optional[Dict[str, Any]], str, str, str, int, bytes]:
+    """
+    统一执行：模型级联 + Key轮询 + Vertex多区容灾(跳过404/避让429) + global 429/503 短退避重试。
+    只有拿到上游 HTTP 200 才返回 ok_resp（流式模式下由调用方消费并 aclose），
+    全部失败则返回真实 HTTP 状态码与错误响应体。
+    """
+    last_status = 503
+    last_err_bytes = b'{"error": {"code": 503, "message": "All keys failed in pool"}}'
     client = get_http_client()
-    model_cascade = build_model_cascade(model_name, pool.flash_auto_fallback)
+    can_cascade = (method == "POST") and (action in ("generateContent", "streamGenerateContent"))
+    model_cascade = build_model_cascade(model_name, pool.flash_auto_fallback and can_cascade) or [model_name]
     stop_early = False
+    multi_timeout = STREAM_MULTI_TIMEOUT if stream else NONSTREAM_MULTI_TIMEOUT
+    single_timeout = STREAM_SINGLE_TIMEOUT if stream else NONSTREAM_SINGLE_TIMEOUT
 
     for m_idx, cur_model in enumerate(model_cascade):
         if stop_early:
             break
         active_candidates = candidates if m_idx == 0 else candidates[:min(len(candidates), 2)]
         max_vx = None if m_idx == 0 else 4
+        cur_raw_path = (
+            f"models/{cur_model}:{action}"
+            if (cur_model and action and cur_model != model_name)
+            else raw_path
+        )
 
         for k_idx, key_item in enumerate(active_candidates):
             k = key_item["key"]
             key_item["last_used"] = time.strftime("%H:%M:%S")
             try:
                 targets = await build_targets_for_key(
-                    k, key_item, cur_model, "generateContent", "", "v1beta",
-                    f"models/{cur_model}:generateContent", client, max_vx_regions=max_vx
+                    k, key_item, cur_model, action, query_str, version_prefix, cur_raw_path, client,
+                    max_vx_regions=max_vx
                 )
             except Exception as e:
-                last_err_text = str(e)
+                last_err_bytes = json.dumps({"error": {"code": 500, "message": str(e)}}, ensure_ascii=False).encode("utf-8")
                 if m_idx == 0:
                     key_item["fail"] = key_item.get("fail", 0) + 1
-                key_item["last_error"] = f"OAuth异常: {last_err_text[:80]}"
+                key_item["last_error"] = f"[{cur_model}] OAuth异常: {str(e)[:80]}"
                 continue
 
-            primary_status = None
-            primary_err_text = None
+            primary_status: Optional[int] = None
+            primary_err_bytes: Optional[bytes] = None
+            primary_err_text: Optional[str] = None
             has_more_models = m_idx < len(model_cascade) - 1
             has_more_keys = k_idx < len(active_candidates) - 1
+            global_rate_limited = False
+            global_fail_status = 429
+            global_backoff_target: Optional[Tuple[str, Dict[str, str]]] = None
 
-            for t_idx, (url, hdrs) in enumerate(targets):
-                region_key = extract_region_key(url)
-                has_more_attempts = (t_idx < len(targets) - 1) or has_more_keys or has_more_models
-                req_timeout = NONSTREAM_MULTI_TIMEOUT if has_more_attempts else NONSTREAM_SINGLE_TIMEOUT
+            async def _try_target(target_url: str, hdrs: Dict[str, str], req_timeout: httpx.Timeout):
+                nonlocal primary_status, primary_err_bytes, primary_err_text
+                nonlocal global_rate_limited, global_fail_status, global_backoff_target
+                region_key = extract_region_key(target_url)
+                resp = None
                 try:
-                    resp = await client.post(url, headers=hdrs, content=gemini_body, timeout=req_timeout)
-                    if resp.status_code == 200:
-                        region_health.mark_success(cur_model, region_key)
-                        key_item["success"] = key_item.get("success", 0) + 1
-                        used_ch = detect_channel_label(url)
-                        tag = cur_model if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
-                        g_json = resp.json()
-                        record_usage_and_cost(key_item, cur_model, used_ch, g_json.get("usageMetadata"))
-                        if cur_model != model_name:
-                            key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                            pool.save()
-                        elif not g_json.get("usageMetadata"):
-                            key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                        openai_resp = gemini_resp_to_openai(g_json, cur_model)
-                        return JSONResponse(content=openai_resp, status_code=200)
+                    if stream:
+                        req = client.build_request(
+                            method=method,
+                            url=target_url,
+                            headers=hdrs,
+                            content=body if method != "GET" else None,
+                            timeout=req_timeout,
+                        )
+                        resp = await client.send(req, stream=True)
                     else:
-                        err_t = resp.text
-                        if should_prefer_error(primary_err_text, primary_status, resp.status_code, err_t):
-                            primary_status = resp.status_code
-                            primary_err_text = err_t
-                        if resp.status_code in RETRYABLE_PROXY_STATUSES:
-                            region_health.mark_failure(cur_model, region_key, status_code=resp.status_code)
-                            continue
-                        stop_early = True
-                        break
+                        resp = await client.request(
+                            method=method,
+                            url=target_url,
+                            headers=hdrs,
+                            content=body if method != "GET" else None,
+                            timeout=req_timeout,
+                        )
                 except Exception as e:
+                    if resp is not None:
+                        try:
+                            await resp.aclose()
+                        except Exception:
+                            pass
                     is_to = isinstance(e, httpx.TimeoutException)
                     region_health.mark_failure(cur_model, region_key, is_timeout=is_to)
-                    if primary_err_text is None:
-                        primary_err_text = f"上游超时: {e}" if is_to else str(e)
+                    if primary_err_bytes is None:
+                        err_msg = f"上游超时: {e}" if is_to else str(e)
+                        primary_err_bytes = json.dumps(
+                            {"error": {"code": 504 if is_to else 502, "message": err_msg}},
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                        primary_err_text = err_msg
+                        if primary_status is None:
+                            primary_status = 504 if is_to else 502
+                    return False, None, ""
+
+                if resp.status_code == 200:
+                    region_health.mark_success(cur_model, region_key)
+                    key_item["success"] = key_item.get("success", 0) + 1
+                    used_ch = detect_channel_label(target_url)
+                    tag = (cur_model or ("stream" if stream else "API")) if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
+                    key_item["last_error"] = f"OK ({tag} via {used_ch})"
+                    return False, resp, used_ch
+
+                try:
+                    err_body = await resp.aread() if stream else resp.content
+                finally:
+                    if stream:
+                        await resp.aclose()
+                err_dec = err_body.decode("utf-8", "ignore")
+                if should_prefer_error(primary_err_text, primary_status, resp.status_code, err_dec):
+                    primary_status = resp.status_code
+                    primary_err_bytes = err_body
+                    primary_err_text = err_dec
+                if resp.status_code in RETRYABLE_PROXY_STATUSES:
+                    region_health.mark_failure(cur_model, region_key, status_code=resp.status_code)
+                    if region_key and region_key.startswith("global:") and resp.status_code in (429, 503):
+                        global_rate_limited = True
+                        global_fail_status = resp.status_code
+                        if global_backoff_target is None:
+                            global_backoff_target = (target_url, hdrs)
+                    return False, None, ""
+                return True, None, ""
+
+            for t_idx, (target_url, hdrs) in enumerate(targets):
+                region_key = extract_region_key(target_url)
+                if region_key and region_key.startswith("global:") and global_rate_limited:
+                    # global:v1beta1 与 global:v1 共享同一 global DSQ 配额，不再 0 延迟连续撞击
+                    region_health.mark_failure(cur_model, region_key, status_code=global_fail_status)
                     continue
+                has_more_attempts = (t_idx < len(targets) - 1) or has_more_keys or has_more_models
+                req_timeout = multi_timeout if has_more_attempts else single_timeout
+                should_stop, ok_resp, used_ch = await _try_target(target_url, hdrs, req_timeout)
+                if ok_resp is not None:
+                    tag = (cur_model or ("stream" if stream else "API")) if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
+                    return ok_resp, key_item, cur_model, tag, used_ch, 200, b""
+                if should_stop:
+                    stop_early = True
+                    break
+
+            if (
+                not stop_early
+                and global_backoff_target is not None
+                and not region_health.has_healthy_non_global(cur_model, VERTEX_REGIONS)
+            ):
+                g_url, g_hdrs = global_backoff_target
+                backoff_delays = (2.0, 4.0)
+                for b_idx, delay in enumerate(backoff_delays):
+                    await asyncio.sleep(delay)
+                    has_more_after = (b_idx < len(backoff_delays) - 1) or has_more_keys or has_more_models
+                    req_timeout = multi_timeout if has_more_after else single_timeout
+                    should_stop, ok_resp, used_ch = await _try_target(g_url, g_hdrs, req_timeout)
+                    if ok_resp is not None:
+                        tag = (cur_model or ("stream" if stream else "API")) if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
+                        return ok_resp, key_item, cur_model, tag, used_ch, 200, b""
+                    if should_stop:
+                        stop_early = True
+                        break
 
             if primary_status:
                 last_status = primary_status
-            if primary_err_text:
-                last_err_text = primary_err_text
+            if primary_err_bytes:
+                last_err_bytes = primary_err_bytes
             if m_idx == 0:
                 key_item["fail"] = key_item.get("fail", 0) + 1
-            key_item["last_error"] = f"[{cur_model}] HTTP {last_status}: {last_err_text[:100]}"
+            key_item["last_error"] = f"[{cur_model}] HTTP {last_status}: {last_err_bytes.decode('utf-8', 'ignore')[:100]}"
             if stop_early:
                 break
 
+    return None, None, model_name, model_name, "", last_status, last_err_bytes
+
+
+async def openai_nonstream_via_native_retry(
+    model_name: str,
+    gemini_body: bytes,
+    candidates: List[Dict[str, Any]]
+):
+    ok_resp, key_item, cur_model, tag, used_ch, last_status, last_err_bytes = await _dispatch_upstream(
+        method="POST",
+        model_name=model_name,
+        action="generateContent",
+        query_str="",
+        version_prefix="v1beta",
+        raw_path=f"models/{model_name}:generateContent",
+        body=gemini_body,
+        candidates=candidates,
+        stream=False,
+    )
+    if ok_resp is not None and key_item is not None:
+        g_json = ok_resp.json()
+        record_usage_and_cost(key_item, cur_model, used_ch, g_json.get("usageMetadata"), display_tag=tag)
+        if not g_json.get("usageMetadata") and cur_model != model_name:
+            pool.save()
+        openai_resp = gemini_resp_to_openai(g_json, cur_model)
+        return JSONResponse(content=openai_resp, status_code=200)
+
+    last_err_text = last_err_bytes.decode("utf-8", "ignore")
     return JSONResponse(status_code=last_status, content={"error": {"message": last_err_text}})
 
 
@@ -1500,136 +1700,76 @@ async def openai_stream_via_native_retry(
     gemini_body: bytes,
     candidates: List[Dict[str, Any]]
 ):
-    last_err = "All keys failed in pool"
+    ok_resp, key_item, cur_model, tag, used_ch, last_status, last_err_bytes = await _dispatch_upstream(
+        method="POST",
+        model_name=model_name,
+        action="streamGenerateContent",
+        query_str="alt=sse",
+        version_prefix="v1beta",
+        raw_path=f"models/{model_name}:streamGenerateContent",
+        body=gemini_body,
+        candidates=candidates,
+        stream=True,
+    )
+    if ok_resp is None or key_item is None:
+        last_err_text = last_err_bytes.decode("utf-8", "ignore")
+        return JSONResponse(status_code=last_status, content={"error": {"message": last_err_text}})
+
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    client = get_http_client()
-    model_cascade = build_model_cascade(model_name, pool.flash_auto_fallback)
-    stop_early = False
 
-    for m_idx, cur_model in enumerate(model_cascade):
-        if stop_early:
-            break
-        active_candidates = candidates if m_idx == 0 else candidates[:min(len(candidates), 2)]
-        max_vx = None if m_idx == 0 else 4
-
-        for k_idx, key_item in enumerate(active_candidates):
-            k = key_item["key"]
-            key_item["last_used"] = time.strftime("%H:%M:%S")
-            primary_err = None
-            primary_status = None
-            try:
-                targets = await build_targets_for_key(
-                    k, key_item, cur_model, "streamGenerateContent", "alt=sse", "v1beta",
-                    f"models/{cur_model}:streamGenerateContent", client, max_vx_regions=max_vx
-                )
-            except Exception as e:
-                primary_err = str(e)
-                if m_idx == 0:
-                    key_item["fail"] = key_item.get("fail", 0) + 1
-                key_item["last_error"] = f"[{cur_model}] OAuth异常: {primary_err[:80]}"
-                last_err = primary_err
-                continue
-
-            has_more_models = m_idx < len(model_cascade) - 1
-            has_more_keys = k_idx < len(active_candidates) - 1
-            stream_started = False
-
-            for t_idx, (url, hdrs) in enumerate(targets):
-                region_key = extract_region_key(url)
-                has_more_attempts = (t_idx < len(targets) - 1) or has_more_keys or has_more_models
-                req_timeout = STREAM_MULTI_TIMEOUT if has_more_attempts else STREAM_SINGLE_TIMEOUT
+    async def _sse_gen():
+        last_usage = None
+        recorded = False
+        try:
+            async for line in ok_resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
                 try:
-                    async with client.stream("POST", url, headers=hdrs, content=gemini_body, timeout=req_timeout) as resp:
-                        if resp.status_code == 200:
-                            region_health.mark_success(cur_model, region_key)
-                            key_item["success"] = key_item.get("success", 0) + 1
-                            used_ch = detect_channel_label(url)
-                            tag = cur_model if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
-                            key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                            last_usage = None
-                            stream_started = True
-                            async for line in resp.aiter_lines():
-                                if not line or not line.startswith("data:"):
-                                    continue
-                                data_str = line[5:].strip()
-                                if not data_str or data_str == "[DONE]":
-                                    continue
-                                try:
-                                    g_chunk = json.loads(data_str)
-                                    if "usageMetadata" in g_chunk:
-                                        last_usage = g_chunk["usageMetadata"]
-                                    cands = g_chunk.get("candidates", [])
-                                    if cands:
-                                        parts = cands[0].get("content", {}).get("parts", [])
-                                        text_piece = "".join(p.get("text", "") for p in parts if "text" in p and not p.get("thought"))
-                                        if text_piece:
-                                            oai_chunk = {
-                                                "id": chat_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": cur_model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"content": text_piece},
-                                                    "finish_reason": None
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
-                                except Exception:
-                                    continue
-                            if last_usage:
-                                record_usage_and_cost(key_item, cur_model, used_ch, last_usage)
-                            if cur_model != model_name:
-                                key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                                pool.save()
-                            done_chunk = {
+                    g_chunk = json.loads(data_str)
+                    if "usageMetadata" in g_chunk:
+                        last_usage = g_chunk["usageMetadata"]
+                    cands = g_chunk.get("candidates", [])
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts", [])
+                        text_piece = "".join(p.get("text", "") for p in parts if "text" in p and not p.get("thought"))
+                        if text_piece:
+                            oai_chunk = {
                                 "id": chat_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
                                 "model": cur_model,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": text_piece},
+                                    "finish_reason": None
+                                }]
                             }
-                            yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
-                            return
-                        else:
-                            err_body = await resp.aread()
-                            err_str = err_body.decode("utf-8", "ignore")
-                            if should_prefer_error(primary_err, primary_status, resp.status_code, err_str):
-                                primary_status = resp.status_code
-                                primary_err = err_str
-                            if resp.status_code in RETRYABLE_PROXY_STATUSES:
-                                region_health.mark_failure(cur_model, region_key, status_code=resp.status_code)
-                                continue
-                            stop_early = True
-                            break
-                except Exception as e:
-                    if stream_started:
-                        done_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": cur_model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                        }
-                        yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
-                        return
-                    is_to = isinstance(e, httpx.TimeoutException)
-                    region_health.mark_failure(cur_model, region_key, is_timeout=is_to)
-                    if primary_err is None:
-                        primary_err = f"上游超时: {e}" if is_to else str(e)
+                            yield f"data: {json.dumps(oai_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                except Exception:
                     continue
+            if last_usage:
+                record_usage_and_cost(key_item, cur_model, used_ch, last_usage, display_tag=tag)
+                recorded = True
+            elif cur_model != model_name:
+                pool.save()
+            done_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": cur_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+        finally:
+            if not recorded and last_usage:
+                record_usage_and_cost(key_item, cur_model, used_ch, last_usage, display_tag=tag)
+            await ok_resp.aclose()
 
-            if primary_err:
-                last_err = primary_err
-            if m_idx == 0:
-                key_item["fail"] = key_item.get("fail", 0) + 1
-            key_item["last_error"] = f"[{cur_model}] {last_err[:100]}"
-            if stop_early:
-                break
-
-    err_payload = {"error": {"message": last_err}}
-    yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+    return StreamingResponse(_sse_gen(), status_code=200, media_type="text/event-stream")
 
 
 # ==================== 2. Google AI Studio 原生接口 (/v1beta/... & /v1/...) ====================
@@ -1661,18 +1801,16 @@ async def google_native_proxy(path: str, request: Request):
 
     if is_stream:
         media_type = "text/event-stream" if request.query_params.get("alt") == "sse" else "application/json"
-        return StreamingResponse(
-            stream_with_retry(
-                method=request.method,
-                model_name=model_name,
-                action=action,
-                query_str=query_str,
-                version_prefix=version_prefix,
-                raw_path=path,
-                body=body,
-                candidates=candidates
-            ),
-            media_type=media_type
+        return await stream_with_retry(
+            method=request.method,
+            model_name=model_name,
+            action=action,
+            query_str=query_str,
+            version_prefix=version_prefix,
+            raw_path=path,
+            body=body,
+            candidates=candidates,
+            media_type=media_type,
         )
     else:
         return await request_with_retry(
@@ -1697,102 +1835,27 @@ async def request_with_retry(
     body: bytes,
     candidates: List[Dict[str, Any]]
 ):
-    last_status = 500
-    last_content = b'{"error": "All keys failed"}'
-    client = get_http_client()
-    can_cascade = (method == "POST") and (action in ("generateContent", "streamGenerateContent"))
-    model_cascade = build_model_cascade(model_name, pool.flash_auto_fallback and can_cascade) or [model_name]
-    stop_early = False
-
-    for m_idx, cur_model in enumerate(model_cascade):
-        if stop_early:
-            break
-        active_candidates = candidates if m_idx == 0 else candidates[:min(len(candidates), 2)]
-        max_vx = None if m_idx == 0 else 4
-        cur_raw_path = (
-            f"models/{cur_model}:{action}"
-            if (cur_model and action and cur_model != model_name)
-            else raw_path
-        )
-
-        for k_idx, key_item in enumerate(active_candidates):
-            k = key_item["key"]
-            key_item["last_used"] = time.strftime("%H:%M:%S")
+    ok_resp, key_item, cur_model, tag, used_ch, last_status, last_content = await _dispatch_upstream(
+        method=method,
+        model_name=model_name,
+        action=action,
+        query_str=query_str,
+        version_prefix=version_prefix,
+        raw_path=raw_path,
+        body=body,
+        candidates=candidates,
+        stream=False,
+    )
+    if ok_resp is not None and key_item is not None:
+        if cur_model and method == "POST":
             try:
-                targets = await build_targets_for_key(
-                    k, key_item, cur_model, action, query_str, version_prefix, cur_raw_path, client,
-                    max_vx_regions=max_vx
-                )
-            except Exception as e:
-                last_content = json.dumps({"error": str(e)}).encode("utf-8")
-                if m_idx == 0:
-                    key_item["fail"] = key_item.get("fail", 0) + 1
-                key_item["last_error"] = f"OAuth异常: {str(e)[:80]}"
-                continue
-
-            primary_status = None
-            primary_content = None
-            primary_err_text = None
-            has_more_models = m_idx < len(model_cascade) - 1
-            has_more_keys = k_idx < len(active_candidates) - 1
-
-            for t_idx, (target_url, hdrs) in enumerate(targets):
-                region_key = extract_region_key(target_url)
-                has_more_attempts = (t_idx < len(targets) - 1) or has_more_keys or has_more_models
-                req_timeout = NONSTREAM_MULTI_TIMEOUT if has_more_attempts else NONSTREAM_SINGLE_TIMEOUT
-                try:
-                    resp = await client.request(
-                        method=method,
-                        url=target_url,
-                        headers=hdrs,
-                        content=body if method != "GET" else None,
-                        timeout=req_timeout,
-                    )
-                    if resp.status_code == 200:
-                        region_health.mark_success(cur_model, region_key)
-                        key_item["success"] = key_item.get("success", 0) + 1
-                        used_ch = detect_channel_label(target_url)
-                        tag = (cur_model or "API") if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
-                        key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                        if cur_model and method == "POST":
-                            try:
-                                g_json = resp.json()
-                                record_usage_and_cost(key_item, cur_model, used_ch, g_json.get("usageMetadata"))
-                                if cur_model != model_name:
-                                    key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                                    pool.save()
-                            except Exception:
-                                pass
-                        return Response(content=resp.content, status_code=200, media_type="application/json")
-                    else:
-                        err_dec = resp.content.decode("utf-8", "ignore")
-                        if should_prefer_error(primary_err_text, primary_status, resp.status_code, err_dec):
-                            primary_status = resp.status_code
-                            primary_content = resp.content
-                            primary_err_text = err_dec
-                        if resp.status_code in RETRYABLE_PROXY_STATUSES:
-                            region_health.mark_failure(cur_model, region_key, status_code=resp.status_code)
-                            continue
-                        stop_early = True
-                        break
-                except Exception as e:
-                    is_to = isinstance(e, httpx.TimeoutException)
-                    region_health.mark_failure(cur_model, region_key, is_timeout=is_to)
-                    if primary_content is None:
-                        err_msg = f"上游超时: {e}" if is_to else str(e)
-                        primary_content = json.dumps({"error": err_msg}).encode("utf-8")
-                        primary_err_text = err_msg
-                    continue
-
-            if primary_status:
-                last_status = primary_status
-            if primary_content:
-                last_content = primary_content
-            if m_idx == 0:
-                key_item["fail"] = key_item.get("fail", 0) + 1
-            key_item["last_error"] = f"[{cur_model}] HTTP {last_status}: {last_content.decode('utf-8', 'ignore')[:100]}"
-            if stop_early:
-                break
+                g_json = ok_resp.json()
+                record_usage_and_cost(key_item, cur_model, used_ch, g_json.get("usageMetadata"), display_tag=tag)
+                if not g_json.get("usageMetadata") and cur_model != model_name:
+                    pool.save()
+            except Exception:
+                pass
+        return Response(content=ok_resp.content, status_code=200, media_type="application/json")
 
     return Response(content=last_content, status_code=last_status, media_type="application/json")
 
@@ -1805,114 +1868,48 @@ async def stream_with_retry(
     version_prefix: str,
     raw_path: str,
     body: bytes,
-    candidates: List[Dict[str, Any]]
+    candidates: List[Dict[str, Any]],
+    media_type: str = "text/event-stream",
 ):
-    last_err_bytes = b'data: {"error": "All keys failed in pool"}\n\n'
-    client = get_http_client()
-    can_cascade = (method == "POST") and (action in ("generateContent", "streamGenerateContent"))
-    model_cascade = build_model_cascade(model_name, pool.flash_auto_fallback and can_cascade) or [model_name]
-    stop_early = False
+    ok_resp, key_item, cur_model, tag, used_ch, last_status, last_err_bytes = await _dispatch_upstream(
+        method=method,
+        model_name=model_name,
+        action=action,
+        query_str=query_str,
+        version_prefix=version_prefix,
+        raw_path=raw_path,
+        body=body,
+        candidates=candidates,
+        stream=True,
+    )
+    if ok_resp is None or key_item is None:
+        return Response(content=last_err_bytes, status_code=last_status, media_type="application/json")
 
-    for m_idx, cur_model in enumerate(model_cascade):
-        if stop_early:
-            break
-        active_candidates = candidates if m_idx == 0 else candidates[:min(len(candidates), 2)]
-        max_vx = None if m_idx == 0 else 4
-        cur_raw_path = (
-            f"models/{cur_model}:{action}"
-            if (cur_model and action and cur_model != model_name)
-            else raw_path
-        )
-
-        for k_idx, key_item in enumerate(active_candidates):
-            k = key_item["key"]
-            key_item["last_used"] = time.strftime("%H:%M:%S")
-            primary_err_bytes = None
-            primary_err_text = None
-            primary_status = None
-            try:
-                targets = await build_targets_for_key(
-                    k, key_item, cur_model, action, query_str, version_prefix, cur_raw_path, client,
-                    max_vx_regions=max_vx
-                )
-            except Exception as e:
-                primary_err_bytes = json.dumps({"error": str(e)}).encode("utf-8")
-                if m_idx == 0:
-                    key_item["fail"] = key_item.get("fail", 0) + 1
-                key_item["last_error"] = f"[{cur_model}] OAuth异常: {str(e)[:80]}"
-                last_err_bytes = primary_err_bytes
-                continue
-
-            has_more_models = m_idx < len(model_cascade) - 1
-            has_more_keys = k_idx < len(active_candidates) - 1
-            stream_started = False
-
-            for t_idx, (target_url, hdrs) in enumerate(targets):
-                region_key = extract_region_key(target_url)
-                has_more_attempts = (t_idx < len(targets) - 1) or has_more_keys or has_more_models
-                req_timeout = STREAM_MULTI_TIMEOUT if has_more_attempts else STREAM_SINGLE_TIMEOUT
+    async def _raw_gen():
+        tail_buf = ""
+        recorded = False
+        try:
+            async for chunk in ok_resp.aiter_bytes():
+                yield chunk
                 try:
-                    async with client.stream(
-                        method=method,
-                        url=target_url,
-                        headers=hdrs,
-                        content=body if method != "GET" else None,
-                        timeout=req_timeout,
-                    ) as resp:
-                        if resp.status_code == 200:
-                            region_health.mark_success(cur_model, region_key)
-                            key_item["success"] = key_item.get("success", 0) + 1
-                            used_ch = detect_channel_label(target_url)
-                            tag = (cur_model or "stream") if cur_model == model_name else f"{cur_model} [替补 {model_name}]"
-                            key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                            tail_buf = ""
-                            stream_started = True
-                            async for chunk in resp.aiter_bytes():
-                                yield chunk
-                                try:
-                                    tail_buf = (tail_buf + chunk.decode("utf-8", "ignore"))[-6000:]
-                                except Exception:
-                                    pass
-                            if cur_model:
-                                usage = extract_usage_from_stream_tail(tail_buf)
-                                if usage:
-                                    record_usage_and_cost(key_item, cur_model, used_ch, usage)
-                            if cur_model != model_name:
-                                key_item["last_error"] = f"OK ({tag} via {used_ch})"
-                                pool.save()
-                            return
-                        else:
-                            err_body = await resp.aread()
-                            err_dec = err_body.decode("utf-8", "ignore")
-                            if should_prefer_error(primary_err_text, primary_status, resp.status_code, err_dec):
-                                primary_status = resp.status_code
-                                primary_err_bytes = err_body
-                                primary_err_text = err_dec
-                            if resp.status_code in RETRYABLE_PROXY_STATUSES:
-                                region_health.mark_failure(cur_model, region_key, status_code=resp.status_code)
-                                continue
-                            stop_early = True
-                            break
-                except Exception as e:
-                    if stream_started:
-                        return
-                    is_to = isinstance(e, httpx.TimeoutException)
-                    region_health.mark_failure(cur_model, region_key, is_timeout=is_to)
-                    if primary_err_bytes is None:
-                        err_msg = f"上游超时: {e}" if is_to else str(e)
-                        primary_err_bytes = json.dumps({"error": err_msg}).encode("utf-8")
-                        primary_err_text = err_msg
-                    continue
+                    tail_buf = (tail_buf + chunk.decode("utf-8", "ignore"))[-6000:]
+                except Exception:
+                    pass
+            if cur_model:
+                usage = extract_usage_from_stream_tail(tail_buf)
+                if usage:
+                    record_usage_and_cost(key_item, cur_model, used_ch, usage, display_tag=tag)
+                    recorded = True
+                elif cur_model != model_name:
+                    pool.save()
+        finally:
+            if cur_model and not recorded and tail_buf:
+                usage = extract_usage_from_stream_tail(tail_buf)
+                if usage:
+                    record_usage_and_cost(key_item, cur_model, used_ch, usage, display_tag=tag)
+            await ok_resp.aclose()
 
-            if primary_err_bytes:
-                last_err_bytes = primary_err_bytes
-            if m_idx == 0:
-                key_item["fail"] = key_item.get("fail", 0) + 1
-            key_item["last_error"] = f"[{cur_model}] {last_err_bytes.decode('utf-8', 'ignore')[:100]}"
-            if stop_early:
-                break
-
-    yield last_err_bytes
+    return StreamingResponse(_raw_gen(), status_code=200, media_type=media_type)
 
 
 GCLOUD_CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
@@ -2091,6 +2088,7 @@ async def admin_exchange_oauth(data: Dict[str, str]):
 
         existing = next((item for item in pool.keys if item["key"] == gcli_key), None)
         if not existing:
+            bal_init = pool._infer_initial_balance(final_note, chosen_tier, chosen_channel)
             pool.keys.append({
                 "key": gcli_key,
                 "tier": chosen_tier,
@@ -2100,7 +2098,11 @@ async def admin_exchange_oauth(data: Dict[str, str]):
                 "success": 1 if working_model else 0,
                 "fail": 0,
                 "last_error": f"✅ 已绑定 {ch_label} ({working_model or chosen_pid})",
-                "last_used": time.strftime("%H:%M:%S")
+                "last_used": time.strftime("%H:%M:%S"),
+                "balance_usd": bal_init,
+                "spent_usd": 0.0,
+                "last_cost_usd": 0.0,
+                "last_tokens": ""
             })
         else:
             existing["note"] = final_note
@@ -2306,7 +2308,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <div class="card">
       <h3>🌍 多区容灾与 Flash 接力设置</h3>
-      <p style="color:var(--muted);font-size:14px;">每次请求会自动按健康状态轮询 Vertex 多区机房，并在某一区域持续 503/429/超时时短暂冷却避让。</p>
+      <p style="color:var(--muted);font-size:14px;">每次请求会自动按健康状态轮询 Vertex 多区机房：遇 404 不支持机房将屏蔽 30 分钟；遇 429/503/超时则短暂冷却避让，仅剩 global 节点时自动短退避重试。</p>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:10px 0;">
         <span id="regionHealthText" style="font-size:14px;color:var(--muted);">正在读取区域健康状态...</span>
         <button onclick="resetRegionCooldowns()" style="margin:0;width:auto;">🧹 清除区域冷却</button>
@@ -2459,7 +2461,7 @@ function renderData(data) {
     if (cooling.length === 0) {
       regionEl.innerText = `✅ 当前全部 ${totalR} 个 Vertex 区域健康可用`;
     } else {
-      const summary = cooling.slice(0, 6).map(c => `${c.model}@${c.region}(${c.remain_sec}s)`).join("，");
+      const summary = cooling.slice(0, 6).map(c => `${c.model}@${c.region}[${c.reason || '冷却'}](${c.remain_sec}s)`).join("，");
       const more = cooling.length > 6 ? ` 等共 ${cooling.length} 项` : "";
       regionEl.innerText = `⏳ 当前冷却 ${cooling.length} 项：${summary}${more}`;
     }
